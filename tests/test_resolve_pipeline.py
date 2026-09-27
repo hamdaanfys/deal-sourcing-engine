@@ -122,15 +122,50 @@ def test_review_file_lists_near_misses(conn, tmp_path):
                 raw(2, "Southern Precision Machining Co.", state="AL"),
                 raw(3, "Blue Ridge Fabrication", website="brf-industrial.test"),
                 raw(4, "BRF Industrial Services", website="brf-industrial.test"),
+                raw(
+                    5,
+                    "Summit Controls",
+                    website="summitcontrols.test",
+                    state="TN",
+                    city="Knoxville",
+                ),
+                raw(
+                    6,
+                    "Summit Controls LLC",
+                    website="summit-controls-tn.test",
+                    state="TN",
+                    city="Knoxville",
+                ),
             ]
         ),
     )
     path = tmp_path / "review" / "possible_matches.csv"
     stats = resolve(conn, source_priority=("csv",), review_path=path)
     rows = list(csv.DictReader(path.open()))
-    assert stats["review_items"] == 2
-    assert {r["kind"] for r in rows} == {"possible_match", "merged_on_domain"}
-    assert {r["reason"] for r in rows} == {
-        "similar name, different state",
-        "same domain, names differ",
+    assert stats["review_items"] == 3
+    assert {(r["kind"], r["reason"]) for r in rows} == {
+        ("possible_match", "similar name, different state"),
+        ("merged_on_domain", "same domain, names differ"),
+        ("different_domains", "same name and location, different domains"),
     }
+    assert stats["companies"] == 5  # the Summit pair is flagged, not merged
+
+
+def test_facebook_pages_do_not_merge_companies_end_to_end(conn):
+    store_records(
+        conn,
+        iter(
+            [
+                raw(
+                    1,
+                    "Oakmont Valve Service",
+                    website="https://www.facebook.com/oakmontvalve",
+                    state="GA",
+                ),
+                raw(2, "Harbor Line Fabricators", website="facebook.com/harborlinefab", state="GA"),
+            ]
+        ),
+    )
+    stats = resolve(conn, source_priority=("csv",))
+    assert stats["companies"] == 2
+    assert [r["domain"] for r in companies(conn)] == [None, None]

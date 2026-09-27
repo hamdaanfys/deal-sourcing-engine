@@ -5,7 +5,8 @@ Rules, in order (thresholds are explained in DESIGN.md §7.2):
 1. Both records have a website domain:
    - same domain  -> merge (a company's domain is the strongest identifier we have). If the
      names are very different the merge still happens but is listed for review.
-   - different domains -> never merged, whatever the names say.
+   - different domains -> never merged automatically. One company can own two domains, so a
+     pair with the same name *and* the same location is listed for review.
 2. Otherwise compare normalized names (0-100) and locations:
    - similarity >= AUTO_MERGE and same state (and city, if both have one) -> merge
    - similarity >= REVIEW, or a strong name match without a location match -> review only
@@ -87,6 +88,15 @@ def compare(a: MatchRecord, b: MatchRecord) -> PairDecision:
             if sim < DOMAIN_NAME_MISMATCH:
                 return PairDecision(a.id, b.id, MERGE, "domain", sim, "same domain, names differ")
             return PairDecision(a.id, b.id, MERGE, "domain", sim, "same domain")
+        if sim >= AUTO_MERGE and location_relation(a, b) == "match":
+            return PairDecision(
+                a.id,
+                b.id,
+                REVIEW_ONLY,
+                "domain_conflict",
+                sim,
+                "same name and location, different domains",
+            )
         return PairDecision(a.id, b.id, DISTINCT, "domain_conflict", sim, "different domains")
 
     loc = location_relation(a, b)

@@ -30,13 +30,30 @@ def test_name_key(raw, key):
 @pytest.mark.parametrize(
     ("url", "key"),
     [
+        # www., other subdomains, scheme, port, path, case and trailing dots all normalize away
         ("https://www.Acme-Mfg.test/about?x=1", "acme-mfg.test"),
         ("acme-mfg.test", "acme-mfg.test"),
-        ("http://shop.acme.co.uk", "acme.co.uk"),
-        ("acme.wixsite.com/home", "acme.wixsite.com"),  # public-suffix-list private domain
-        ("acme.squarespace.com", "acme.squarespace.com"),  # our shared-hosting list
-        ("https://www.facebook.com/acmemfg", None),  # generic platform
-        ("jo@acme-mfg.test", None),  # an email address is not a website
+        ("HTTPS://WWW.ACME.COM:443/", "acme.com"),
+        ("www2.acme.com", "acme.com"),
+        ("shop.acme.com", "acme.com"),
+        ("https://portal.eu.acme.com/login", "acme.com"),
+        ("acme.com.", "acme.com"),
+        ("http://shop.acme.co.uk", "acme.co.uk"),  # multi-part public suffix
+        # platforms and shared hosting: never a company's identifying domain
+        ("https://www.facebook.com/oakmontvalve", None),
+        ("m.facebook.com/harborline", None),
+        ("linkedin.com/company/acme", None),
+        ("https://www.yelp.com/biz/acme-macon", None),
+        ("acme.wixsite.com/home", None),
+        ("wixsite.com", None),
+        ("acme.godaddysites.com", None),
+        ("acme.business.site", None),
+        ("acme.squarespace.com", None),
+        ("acme.github.io", None),  # public suffix list, private section
+        ("acme.myshopify.com", None),
+        ("sites.google.com/view/acme", None),
+        # not websites at all
+        ("jo@acme-mfg.test", None),
         ("", None),
         (None, None),
         ("n/a", None),

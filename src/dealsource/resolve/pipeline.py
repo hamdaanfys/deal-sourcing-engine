@@ -225,7 +225,12 @@ def write_review(path: Path, loaded: list[LoadedRecord], result: Clustering) -> 
         ]
 
     for d in result.review:
-        kind = "merged_on_domain" if d.decision == "merge" else "possible_match"
+        if d.decision == "merge":
+            kind = "merged_on_domain"
+        elif d.method == "domain_conflict":
+            kind = "different_domains"
+        else:
+            kind = "possible_match"
         rows.append(row(kind, d, d.reason))
     for d, why in result.rejected:
         rows.append(row("merge_blocked", d, why))

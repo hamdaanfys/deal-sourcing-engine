@@ -250,15 +250,25 @@ without merging distinct companies.
   (tools→tool, industries→industry). If a name is nothing but suffixes, it keeps them rather
   than becoming empty. The display name is never changed. Example: "Acme Mfg. LLC" and
   "ACME Manufacturing, Inc." both become `acme manufacturing`.
-- **Domain key**: parse the URL, lowercase, strip scheme, `www.`, path and port, and reduce to
-  the registrable domain (eTLD+1) using `tldextract` **with its bundled suffix list, no network
-  refresh and no disk cache**, which keeps tests offline and runs deterministic. The PSL's
-  private section is included, so `acme.wixsite.com` stays a full host. Our own
-  shared-hosting list does the same for builders the PSL doesn't cover (squarespace.com,
-  weebly.com, business.site, …). Generic domains (facebook.com, linkedin.com, gmail.com, …)
-  and email addresses give no key, so they can't act as a shared identifier. A suffix that
-  isn't on the list at all (e.g. the reserved `.test` TLD used in fixtures) falls back to the
-  last two labels.
+- **Domain key**: parse the URL, lowercase, strip scheme, port, path, a trailing dot and
+  `www.`/`www2.`, and reduce to the registrable domain (eTLD+1) using `tldextract` **with its
+  bundled suffix list, no network refresh and no disk cache**, which keeps tests offline and
+  runs deterministic. So `https://WWW.Acme.com:443/about`, `shop.acme.com` and `acme.com.` all
+  give `acme.com`, while `shop.acme.co.uk` gives `acme.co.uk`.
+- **Platform and shared-hosting URLs mean "no website".** A Facebook page, LinkedIn profile,
+  Yelp listing or `acme.wixsite.com` site says nothing about which company it is. Worse, if
+  `facebook.com` counted as a domain, every company with a Facebook page would merge. These
+  records get **no** domain key and are matched on name + location like any record without a
+  website. Two checks catch them:
+  - `PLATFORM_DOMAINS` in `normalize.py`: social networks, directories and data vendors, site
+    builders (wix.com, wixsite.com, squarespace.com, weebly.com, godaddysites.com,
+    business.site, wordpress.com, google.com incl. sites.google.com, …), marketplaces and
+    email providers
+  - anything in the public suffix list's private section (github.io, myshopify.com,
+    blogspot.com, …), which lists exactly the platforms that hand out subdomains
+
+  Email addresses also give no key. A suffix that isn't on the list at all (e.g. the reserved
+  `.test` TLD used in fixtures) falls back to the last two labels.
 - **Location**: US state names → USPS codes, city lowercased with St./Ft. expanded, and
   country variants (USA, United States, …) → `US`.
 
@@ -275,7 +285,11 @@ The same normalization is used to key labels (§11.2).
      website is the strongest identifier we have (e.g. "Blue Ridge Fabrication" and "BRF
      Industrial Services" on the same domain). If the name similarity is below 50, the merge
      still happens but is also listed in the review file.
-   - **Both have a domain and they differ → never merged**, even with identical names.
+   - **Both have a domain and they differ → never merged automatically**, even with identical
+     names. But one company can own two domains (a rebrand, a second brand, a regional site),
+     so a pair with **the same name (≥ 93) and the same location** is flagged for review as
+     `different_domains`. Different domains with different names or different/unknown
+     locations are simply different companies.
    - **Otherwise (at least one record has no website)**, compare names and location. Name
      similarity is `rapidfuzz.token_sort_ratio` on the name keys (0–100), or 100 if the keys
      are equal once spaces are removed ("metal works" vs "metalworks"). Location is `match`
@@ -327,9 +341,11 @@ The same normalization is used to key labels (§11.2).
    everything; a pair that's in both is an error. Refs that don't exist are counted and
    reported.
 8. **Review**: `dealsource resolve --review` writes `private/review/possible_matches.csv`
-   with three kinds of row: `possible_match` (review-only pairs that ended up in different
-   companies), `merged_on_domain` (same domain, names differ) and `merge_blocked` (refused by a
-   constraint). The terminal shows only counts.
+   with four kinds of row: `possible_match` (review-only name pairs that ended up in different
+   companies), `different_domains` (same name and location, different domains),
+   `merged_on_domain` (same domain, names differ) and `merge_blocked` (refused by a
+   constraint). Confirmed same-company pairs go into `overrides.yaml` as `merge`, and
+   confirmed different pairs as `split`. The terminal shows only counts.
 
 Every merge stores its evidence in `company_records`: method (`domain`, `name_location`,
 `override`, or `singleton`), name similarity, the other record's ref, and the reason.
@@ -825,3 +841,5 @@ component (after v1).
 | 2026-09-27 | A tracked pre-commit hook (`.githooks/pre-commit`) blocks `private/`, `.env*` (except `.env.example`) and DB files. It's enabled per clone with `git config core.hooksPath .githooks` (§4.2). |
 | 2026-09-27 | Entity resolution: same domain always merges (listed for review if names differ); different domains never merge; otherwise name similarity ≥ 93 **and** matching location merges, 85–93 or a location mismatch goes to review (§7.2). |
 | 2026-09-27 | The Census API now requires `CENSUS_API_KEY`. The CBP adapter supports 2017–2023 (`NAICS2017`) (§6.2). |
+| 2026-09-27 | Platform and shared-hosting URLs (Facebook, LinkedIn, Yelp, wixsite, godaddysites, business.site, PSL private-section hosts, …) count as "no website"; `www.` and subdomains normalize to the registrable domain (§7.1). |
+| 2026-09-27 | Different domains still never auto-merge, but same name + same location + different domains is flagged for review (`different_domains`) (§7.2). |

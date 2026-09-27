@@ -93,11 +93,96 @@ def test_company_without_website_or_location_is_only_flagged():
 # --- Other edge cases -------------------------------------------------------------------
 
 
-def test_different_domains_never_merge_even_with_identical_names():
+def test_same_name_same_location_different_domains_is_flagged_not_merged():
+    # Could be one company with two domains, or two companies: a person decides.
+    a = rec(1, "Summit Controls", website="summitcontrols.test", state="TN", city="Knoxville")
+    b = rec(
+        2, "Summit Controls LLC", website="summit-controls-tn.test", state="TN", city="Knoxville"
+    )
+    d = compare(a, b)
+    assert d.decision == REVIEW_ONLY
+    assert d.reason == "same name and location, different domains"
+    result = cluster([a, b])
+    assert not same_company(result, 1, 2)
+    assert [(r.a, r.b, r.method) for r in result.review] == [(1, 2, "domain_conflict")]
+
+
+def test_different_domains_in_different_states_are_distinct_and_not_flagged():
     a = rec(1, "Summit Controls", website="summitcontrols.test", state="TN")
-    b = rec(2, "Summit Controls", website="summit-controls-tn.test", state="TN")
+    b = rec(2, "Summit Controls", website="summit-controls-oh.test", state="OH")
     assert compare(a, b).decision == DISTINCT
-    assert not same_company(cluster([a, b]), 1, 2)
+    result = cluster([a, b])
+    assert not same_company(result, 1, 2) and result.review == []
+
+
+def test_different_domains_with_different_names_are_not_flagged():
+    a = rec(1, "Summit Controls", website="summitcontrols.test", state="TN", city="Knoxville")
+    b = rec(2, "Summit Automation", website="summitautomation.test", state="TN", city="Knoxville")
+    assert compare(a, b).decision == DISTINCT
+    assert cluster([a, b]).review == []
+
+
+def test_different_domains_with_unknown_location_are_not_flagged():
+    a = rec(1, "Summit Controls", website="summitcontrols.test")
+    b = rec(2, "Summit Controls", website="summit-controls-tn.test")
+    assert compare(a, b).decision == DISTINCT
+
+
+# --- Platform and shared-hosting URLs ------------------------------------------------------
+
+
+def test_unrelated_companies_on_facebook_are_not_merged():
+    # If facebook.com counted as a domain, these would merge on "same domain".
+    a = rec(1, "Oakmont Valve Service", website="https://www.facebook.com/oakmontvalve", state="GA")
+    b = rec(2, "Harbor Line Fabricators", website="facebook.com/harborlinefab", state="GA")
+    assert a.domain is None and b.domain is None
+    assert compare(a, b).decision == DISTINCT
+    result = cluster([a, b])
+    assert result.clusters == [[1], [2]] and result.review == []
+
+
+@pytest.mark.parametrize(
+    "platform_url",
+    [
+        "https://www.linkedin.com/company/{slug}",
+        "https://www.yelp.com/biz/{slug}",
+        "{slug}.wixsite.com/home",
+        "{slug}.godaddysites.com",
+        "{slug}.business.site",
+    ],
+)
+def test_unrelated_companies_on_the_same_platform_are_not_merged(platform_url):
+    a = rec(1, "Oakmont Valve Service", website=platform_url.format(slug="oakmont"), state="GA")
+    b = rec(
+        2, "Harbor Line Fabricators", website=platform_url.format(slug="harborline"), state="GA"
+    )
+    assert (a.domain, b.domain) == (None, None)
+    assert cluster([a, b]).clusters == [[1], [2]]
+
+
+def test_platform_page_is_treated_as_no_website_for_matching():
+    # The Facebook page must not block a match with the company's real site (no domain conflict)...
+    real = rec(1, "Harbor Line Fabricators", website="harborline.test", state="GA", city="Savannah")
+    fb = rec(
+        2,
+        "Harbor Line Fabricators LLC",
+        website="facebook.com/harborlinefab",
+        state="GA",
+        city="Savannah",
+    )
+    d = compare(real, fb)
+    assert d.decision == MERGE and d.method == "name_location"
+    # ...and it must not merge on its own without a location match either.
+    elsewhere = rec(3, "Harbor Line Fabricators", website="facebook.com/harborline-fl", state="FL")
+    assert compare(fb, elsewhere).decision == REVIEW_ONLY
+
+
+def test_www_and_subdomains_count_as_the_same_domain():
+    a = rec(1, "Acme Manufacturing", website="https://www.acme-mfg.test/about", state="GA")
+    b = rec(2, "Acme Parts Store", website="http://shop.acme-mfg.test", state="SC")
+    c = rec(3, "Acme Mfg", website="ACME-MFG.TEST", state="GA")
+    assert a.domain == b.domain == c.domain == "acme-mfg.test"
+    assert cluster([a, b, c]).clusters == [[1, 2, 3]]
 
 
 def test_record_without_domain_cannot_bridge_two_domains():

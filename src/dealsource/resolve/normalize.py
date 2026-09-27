@@ -57,33 +57,45 @@ ABBREVIATIONS = {
     "mfring": "manufacturing",
 }
 
-# Generic platforms: a URL on these says nothing about which company it is.
-GENERIC_DOMAINS = frozenset(
+# Platforms, directories, site builders and email providers. A URL on one of these (a Facebook
+# page, acme.wixsite.com, a Yelp listing) says nothing about which company it is, so the record
+# is treated as having no website. Hosts in the public suffix list's private section
+# (wixsite.com, github.io, myshopify.com, blogspot.com, ...) are caught separately.
+PLATFORM_DOMAINS = frozenset(
     {
+        # social and professional networks
         "facebook.com",
+        "fb.com",
         "linkedin.com",
         "instagram.com",
         "twitter.com",
         "x.com",
         "youtube.com",
-        "google.com",
+        "tiktok.com",
+        "pinterest.com",
+        "nextdoor.com",
+        # directories, reviews and data vendors
         "yelp.com",
         "bbb.org",
         "manta.com",
         "mapquest.com",
-        "gmail.com",
-        "yahoo.com",
-        "outlook.com",
-        "hotmail.com",
-        "aol.com",
-        "icloud.com",
-    }
-)
-
-# Site builders where each customer gets a subdomain; the full host identifies the company.
-# (Hosts the public suffix list already treats this way, e.g. wixsite.com, need no entry.)
-SHARED_HOSTING = frozenset(
-    {
+        "yellowpages.com",
+        "angi.com",
+        "homeadvisor.com",
+        "thumbtack.com",
+        "houzz.com",
+        "zoominfo.com",
+        "dnb.com",
+        "crunchbase.com",
+        "bizapedia.com",
+        "opencorporates.com",
+        "thomasnet.com",
+        # site builders and link pages
+        "google.com",
+        "g.page",
+        "goo.gl",
+        "wix.com",
+        "wixsite.com",
         "squarespace.com",
         "weebly.com",
         "business.site",
@@ -93,8 +105,22 @@ SHARED_HOSTING = frozenset(
         "site123.me",
         "jimdosite.com",
         "square.site",
+        "carrd.co",
+        "linktr.ee",
+        # marketplaces
+        "amazon.com",
+        "etsy.com",
+        "ebay.com",
+        # email providers
+        "gmail.com",
+        "yahoo.com",
+        "outlook.com",
+        "hotmail.com",
+        "aol.com",
+        "icloud.com",
     }
 )
+
 
 US_STATES = {
     "alabama": "AL",
@@ -195,7 +221,11 @@ def name_key(name: str) -> str:
 
 
 def domain_key(url: str | None) -> str | None:
-    """Registrable domain for a URL or bare host, or None if absent or generic."""
+    """The company's registrable domain for a URL or bare host.
+
+    ``https://WWW.Acme.com:443/about`` and ``shop.acme.com`` both give ``acme.com``. Returns None
+    for missing values, email addresses and platform/shared-hosting URLs.
+    """
     if not url or not url.strip():
         return None
     raw = url.strip().lower()
@@ -203,19 +233,22 @@ def domain_key(url: str | None) -> str | None:
         return None
     if "://" not in raw:
         raw = "http://" + raw
-    host = (urlsplit(raw).hostname or "").strip(".")
+    try:
+        host = (urlsplit(raw).hostname or "").strip(".")
+    except ValueError:
+        return None
     if not host or "." not in host:
         return None
-    host = host.removeprefix("www.")
+    host = re.sub(r"^www\d*\.", "", host)
     parts = _extract(host)
+    if parts.is_private:  # PSL private section: a platform handing out subdomains
+        return None
     registrable = parts.top_domain_under_public_suffix
     if not registrable:
         # Suffix not on the public list (e.g. reserved test TLDs): use the last two labels.
         registrable = ".".join(host.split(".")[-2:])
-    if registrable in GENERIC_DOMAINS:
+    if registrable in PLATFORM_DOMAINS:
         return None
-    if registrable in SHARED_HOSTING and host != registrable:
-        return host
     return registrable
 
 
