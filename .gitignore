@@ -1,0 +1,6 @@
+.venv/
+.env
+private/
+__pycache__/
+*.db
+.cache/

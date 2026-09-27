@@ -1,0 +1,15 @@
+#!/bin/sh
+# Refuse to commit confidential files (see DESIGN.md §4.2).
+# Enable once per clone: git config core.hooksPath .githooks
+
+blocked=$(git diff --cached --name-only --diff-filter=ACMRT \
+  | grep -E '(^|/)private/|(^|/)\.env($|\.)|\.(db|sqlite|sqlite3)$' \
+  | grep -vE '(^|/)\.env\.example$')
+
+if [ -n "$blocked" ]; then
+  echo "pre-commit: refusing to commit confidential files:" >&2
+  echo "$blocked" | sed 's/^/  /' >&2
+  echo "Unstage them with: git restore --staged <path>" >&2
+  exit 1
+fi
+exit 0
