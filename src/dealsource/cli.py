@@ -16,6 +16,14 @@ from dotenv import load_dotenv
 
 from dealsource import db
 from dealsource.config import Settings, user_agent
+from dealsource.eval.labels import LabelsError
+from dealsource.eval.split import (
+    DEFAULT_SEED,
+    DEFAULT_TEST_FRACTION,
+    SplitRefused,
+    format_counts,
+    make_split,
+)
 from dealsource.httpcache import CachedHttp
 from dealsource.models import GeoSpec
 from dealsource.resolve.pipeline import resolve as run_resolve
@@ -25,6 +33,8 @@ from dealsource.sources.csv_source import ContactColumnError, CSVSource, store_r
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 ingest_app = typer.Typer(no_args_is_help=True, help="Load companies or market data from a source.")
 app.add_typer(ingest_app, name="ingest")
+labels_app = typer.Typer(no_args_is_help=True, help="Analyst labels: the one-time dev/test split.")
+app.add_typer(labels_app, name="labels")
 
 
 def make_http_client() -> httpx.Client:
@@ -210,3 +220,36 @@ def stats(ctx: typer.Context) -> None:
     for table in ("raw_records", "companies", "market_stats", "http_cache", "runs"):
         n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         typer.echo(f"{table:12} {n}")
+
+
+@labels_app.command("split")
+def labels_split(
+    ctx: typer.Context,
+    test_fraction: Annotated[
+        float, typer.Option(help="Share of companies held out for the test set")
+    ] = DEFAULT_TEST_FRACTION,
+    seed: Annotated[int, typer.Option(help="Random seed for the split")] = DEFAULT_SEED,
+    map_: Annotated[
+        list[str],
+        typer.Option("--map", help="field=Column for company_name, website, state, decision"),
+    ] = [],  # noqa: B006
+) -> None:
+    """Split labels.csv into dev and held-out test sets, once. Prints counts only."""
+    settings: Settings = ctx.obj
+    try:
+        result = make_split(
+            labels_path=settings.labels_path,
+            manifest_path=settings.split_manifest_path,
+            db_path=settings.db_path,
+            conflicts_path=settings.data_dir / "evals" / "label_conflicts.csv",
+            seed=seed,
+            test_fraction=test_fraction,
+            column_map=parse_map(map_),
+        )
+    except (SplitRefused, LabelsError, ValueError) as exc:
+        typer.echo(f"Refusing to split: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        f"Labels split written to {result.manifest_path} (read-only; never redone). "
+        f"{result.rows} label rows -> {result.companies} companies." + format_counts(result.counts)
+    )

@@ -594,10 +594,13 @@ can be mapped with `--map`, as for CSV ingest):
 | `company_name` | yes | |
 | `website` | strongly recommended | primary match key |
 | `state` | optional | helps name-based matching |
-| `decision` | yes | **binary**: the analyst's decision on the company (positive = would pursue, negative = pass). Accepted values: `1/0`, `yes/no`, `pursue/pass`, `target/pass` (case-insensitive, and the mapping is configurable). Any other value is an error. |
+| `decision` | yes | **binary**: the analyst's decision on the company (positive = would pursue, negative = pass). Accepted values: `1/0`, `yes/no`, `y/n`, `true/false`, `pursue/pass`, `target/pass` (case-insensitive). Any other value is an error. |
 | `notes` | optional | never loaded; ignored by the code |
 
-Any contact-info-looking columns are rejected, the same as in CSV ingest (§6.1). Labels are
+Only these four columns are read (headers are auto-detected, e.g. `Company Name`, `Website`,
+`ST`, `Label`). Every other column, including notes and anything contact-like, is never
+loaded, and mapping a contact-looking column with `--map` is an error. Errors about bad rows
+cite row numbers only, never company names. Labels are
 binary only; graded labels are out of scope for v1. Elsewhere in this document, "label" means
 this binary decision.
 
@@ -638,7 +641,7 @@ Order of operations:
 - **Stratified by decision, grouped by label key**: groups are first partitioned by decision
   (positive / negative). Within each stratum the sorted group keys are shuffled with
   `random.Random(seed)` (sorting first means file row order has no effect), and
-  `round(0.3 × n_stratum)` groups go to `test`. Each stratum gets at least one test group when
+  `0.3 × n_stratum` groups, rounded half up, go to `test`. Each stratum gets at least one test group when
   it has at least two groups. The dev and test sets therefore have the same pursue/pass
   balance as the full file, up to rounding.
 - **Written once** to `private/labels_split.json`, which is then set read-only
@@ -651,13 +654,23 @@ Order of operations:
     "test_fraction": 0.3,
     "stratified_by": "decision",
     "labels_sha256": "<hash of labels.csv at split time>",
+    "grouped_by": "label_key",
+    "labels_rows": 26,
     "db_had_runs": false,
-    "rule_for_new_keys": "sha256(seed:key) < test_fraction",
+    "rule_for_new_keys": "sha256(f'{seed}:{key}') / 2**256 < test_fraction",
     "counts": {"dev": {"pursue": …, "pass": …}, "test": {"pursue": …, "pass": …}},
-    "assignments": {"d:example.com": "dev", "n:acme tool|ga": "test", …}
+    "assignments": {"d:example.com": "dev", "n:acme tool|ga": "test", …},
+    "decisions": {"d:example.com": "pursue", "n:acme tool|ga": "pass", …}
   }
   ```
-- The command prints aggregate counts only (per split × decision), never keys or names.
+  `decisions` records each company's decision at split time, so `labels status` can later
+  detect a decision that changed afterwards. The file is created exclusively (never
+  overwritten), even if two runs race.
+- The command prints aggregate counts only: label rows → companies, then total, dev and test,
+  each with pursue/pass counts. It never prints names, websites or keys. Refusals (second run,
+  missing file, conflicts, prior pipeline runs) exit with code 1.
+
+Implemented in `eval/labels.py` and `eval/split.py`. `labels status` isn't implemented yet.
 
 **Pipeline gating**: `ingest`, `resolve`, `enrich`, `score`, `run` and `eval` refuse to start
 (exit code 2) while `private/labels_split.json` is missing. That covers both the case where `labels.csv`
@@ -843,3 +856,4 @@ component (after v1).
 | 2026-09-27 | The Census API now requires `CENSUS_API_KEY`. The CBP adapter supports 2017–2023 (`NAICS2017`) (§6.2). |
 | 2026-09-27 | Platform and shared-hosting URLs (Facebook, LinkedIn, Yelp, wixsite, godaddysites, business.site, PSL private-section hosts, …) count as "no website"; `www.` and subdomains normalize to the registrable domain (§7.1). |
 | 2026-09-27 | Different domains still never auto-merge, but same name + same location + different domains is flagged for review (`different_domains`) (§7.2). |
+| 2026-09-27 | `labels split` implemented: prints counts only (total, and pursue/pass for dev and test); rounds half up; the manifest also stores the decisions at split time (§11.3). |

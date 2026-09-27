@@ -1,0 +1,27 @@
+Company Name,Website,State,Decision,Contact Email,Notes
+Acme Mfg. LLC,acme-mfg.test,GA,pursue,pat@acme-mfg.test,Strong fit
+ACME Manufacturing Inc.,https://www.acme-mfg.test/about,GA,Pursue,,Duplicate row for the same company
+Harbor Line Fabricators,harborline.test,GA,pass,lee@harborline.test,Too large
+Oakmont Valve Service,https://www.facebook.com/oakmontvalve,TN,yes,,Facebook page only
+Oakmont Valve Service LLC,,TN,1,,Same company without a website
+Blue Ridge Fabrication,brf-industrial.test,NC,pass,,
+Summit Controls,summitcontrols.test,TN,pursue,,
+Carolina Valve,carolinavalve.test,NC,no,,
+Delta Machine,deltamachine.test,FL,0,,
+Delta Marine,deltamarine.test,FL,pass,,
+Peach State Welding,,GA,pursue,,
+Bluegrass Precision Tooling,bluegrassprecision.test,KY,pass,,
+Apex Tool,apextool.test,GA,pass,,
+Ajax Tool,ajaxtool.test,GA,pursue,,
+Southern Precision Machining,southernprecision.test,GA,pass,,
+Northern Precision Machining,northernprecision.test,OH,pass,,
+Gulf Coast Hydraulics,gulfcoasthydraulics.test,AL,pursue,,
+Piedmont Coatings,piedmontcoatings.test,SC,pass,,
+Riverbend Castings,riverbendcastings.test,TN,pass,,
+Tidewater Pump & Motor,tidewaterpump.test,VA,pursue,,
+Magnolia Controls,magnoliacontrols.test,MS,pass,,
+Cumberland Gear Works,cumberlandgear.test,KY,pursue,,
+Lowcountry Electric Motors,lowcountrymotors.test,SC,pass,,
+Ozark Industrial Supply,ozarksupply.test,AR,pass,,
+Bayou Welding Services,,LA,pursue,,
+Granite Peak Machining,granitepeak.test,NC,pass,,
