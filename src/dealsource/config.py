@@ -22,6 +22,12 @@ class Settings:
     # Earlier sources win when building a company's canonical record.
     source_priority: tuple[str, ...] = DEFAULT_SOURCE_PRIORITY
     user_agent_contact: str | None = None
+    llm_backend: str = "ollama"
+    llm_model: str = "qwen2.5:7b"
+    ollama_host: str = "http://127.0.0.1:11434"
+    allow_remote_llm: bool = False
+    fetch_min_delay: float = 2.0
+    fetch_max_pages: int = 5
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -34,6 +40,12 @@ class Settings:
             census_api_key=env.get("CENSUS_API_KEY") or None,
             source_priority=priority or DEFAULT_SOURCE_PRIORITY,
             user_agent_contact=env.get("DEALSOURCE_USER_AGENT_CONTACT") or None,
+            llm_backend=env.get("LLM_BACKEND") or "ollama",
+            llm_model=env.get("LLM_MODEL") or "qwen2.5:7b",
+            ollama_host=env.get("OLLAMA_HOST") or "http://127.0.0.1:11434",
+            allow_remote_llm=env.get("DEALSOURCE_ALLOW_REMOTE_LLM") == "1",
+            fetch_min_delay=float(env.get("FETCH_MIN_DELAY_SECONDS") or 2.0),
+            fetch_max_pages=int(env.get("FETCH_MAX_PAGES_PER_SITE") or 5),
         )
 
     @property

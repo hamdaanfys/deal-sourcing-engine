@@ -18,6 +18,7 @@ from pathlib import Path
 
 from dealsource.db import utcnow
 from dealsource.models import RawCompanyRecord
+from dealsource.privacy import EMAIL_RE, LINKEDIN_PERSON_RE, PHONE_RE, scrub_contact_info
 from dealsource.sources.base import register_company_source
 
 # Recognised header spellings per field (compared after lowercasing and removing non-letters).
@@ -96,10 +97,6 @@ CONTACT_PAIRS = frozenset(
     }
 )
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# Separators are required so bare numbers (revenue, IDs) are not mistaken for phone numbers.
-PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)")
-LINKEDIN_PERSON_RE = re.compile(r"linkedin\.com/in/", re.IGNORECASE)
 
 REVENUE_UNITS = {"usd": 1e-6, "usd_k": 1e-3, "usd_m": 1.0}
 
@@ -123,11 +120,6 @@ def is_contact_header(header: str) -> bool:
     if any(w in CONTACT_WORDS or w.startswith("email") for w in words):
         return True
     return any(pair in CONTACT_PAIRS for pair in zip(words, words[1:], strict=False))
-
-
-def scrub_contact_info(text: str) -> str:
-    text = EMAIL_RE.sub("[removed]", text)
-    return PHONE_RE.sub("[removed]", text)
 
 
 def looks_like_contact_value(value: str) -> bool:

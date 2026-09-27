@@ -84,6 +84,53 @@ MIGRATIONS: list[str] = [
         stats_json TEXT
     );
     """,
+    # 2: enrichment (LLM cache, per-call metrics, per-company results)
+    """
+    CREATE TABLE llm_cache (
+        cache_key TEXT PRIMARY KEY,
+        backend TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        schema_hash TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE llm_calls (
+        id INTEGER PRIMARY KEY,
+        company_id INTEGER,
+        stage TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        latency_ms REAL,
+        cache_hit INTEGER NOT NULL,
+        ok INTEGER NOT NULL,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_llm_calls_company ON llm_calls(company_id);
+
+    CREATE TABLE enrichments (
+        company_id INTEGER PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        detail TEXT,
+        extraction_json TEXT,
+        pages_used_json TEXT NOT NULL,
+        text_sha256 TEXT,
+        llm_cache_key TEXT,
+        mask_version INTEGER,
+        fetch_ms REAL,
+        llm_ms REAL,
+        total_ms REAL,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        updated_at TEXT NOT NULL
+    );
+    """,
 ]
 
 

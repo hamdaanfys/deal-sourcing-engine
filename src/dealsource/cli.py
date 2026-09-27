@@ -15,7 +15,12 @@ import typer
 from dotenv import load_dotenv
 
 from dealsource import db
+from dealsource.clock import SystemClock
 from dealsource.config import Settings, user_agent
+from dealsource.enrich.fetcher import PoliteFetcher, is_cacheable_page
+from dealsource.enrich.pipeline import EnrichConfig
+from dealsource.enrich.pipeline import enrich as run_enrich
+from dealsource.enrich.prompts import PROMPT_VERSION
 from dealsource.eval.labels import LabelsError
 from dealsource.eval.split import (
     DEFAULT_SEED,
@@ -25,6 +30,8 @@ from dealsource.eval.split import (
     make_split,
 )
 from dealsource.httpcache import CachedHttp
+from dealsource.llm.cache import LLMRunner
+from dealsource.llm.ollama import OllamaBackend, RemoteHostRefused
 from dealsource.models import GeoSpec
 from dealsource.resolve.pipeline import resolve as run_resolve
 from dealsource.sources.census_cbp import CensusCBPSource, CensusError, store_stats
@@ -40,6 +47,32 @@ app.add_typer(labels_app, name="labels")
 def make_http_client() -> httpx.Client:
     """Factory for outbound HTTP; tests replace it with a MockTransport-backed client."""
     return httpx.Client(timeout=30.0)
+
+
+def make_llm_backend(settings: Settings):
+    """Factory for the LLM backend; tests replace it with a fake."""
+    if settings.llm_backend != "ollama":
+        raise ValueError(
+            f"LLM_BACKEND {settings.llm_backend!r} is not supported; only 'ollama' is implemented"
+        )
+    return OllamaBackend(
+        settings.ollama_host, settings.llm_model, allow_remote=settings.allow_remote_llm
+    )
+
+
+def make_clock():
+    return SystemClock()
+
+
+def parse_age(value: str | None) -> float | None:
+    """'30d', '12h' or '45m' -> seconds."""
+    if not value:
+        return None
+    units = {"d": 86400, "h": 3600, "m": 60}
+    try:
+        return float(value[:-1]) * units[value[-1]]
+    except (KeyError, ValueError) as exc:
+        raise typer.BadParameter("use a number followed by d, h or m, e.g. 30d") from exc
 
 
 @app.callback()
@@ -210,6 +243,73 @@ def resolve(
 
 
 @app.command()
+def enrich(
+    ctx: typer.Context,
+    limit: Annotated[int | None, typer.Option(help="Enrich at most this many companies")] = None,
+    company_id: Annotated[list[int], typer.Option(help="Only these company IDs")] = [],  # noqa: B006
+    max_pages: Annotated[
+        int | None, typer.Option(help="Pages per site, including the homepage")
+    ] = None,
+    refresh_older_than: Annotated[
+        str | None, typer.Option(help="Re-fetch cached pages older than e.g. 30d")
+    ] = None,
+) -> None:
+    """Fetch each company's website politely and extract structured facts with the local LLM."""
+    settings: Settings = ctx.obj
+    require_split(settings)
+    if not settings.user_agent_contact:
+        typer.echo(
+            "Error: set DEALSOURCE_USER_AGENT_CONTACT in .env (a URL or mailbox site owners can "
+            "use to reach you); it goes in the user agent of every request.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        backend = make_llm_backend(settings)
+    except (RemoteHostRefused, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    max_age = parse_age(refresh_older_than)
+    conn = open_db(settings)
+    clock = make_clock()
+    params = {
+        "limit": limit,
+        "company_id": company_id,
+        "max_pages": max_pages,
+        "refresh_older_than": refresh_older_than,
+    }
+    with make_http_client() as client, db.record_run(conn, "enrich", params) as stats:
+        http = CachedHttp(conn, client, user_agent(settings), cacheable=is_cacheable_page)
+        fetcher = PoliteFetcher(
+            http, clock=clock, min_delay=settings.fetch_min_delay, page_max_age_seconds=max_age
+        )
+        runner = LLMRunner(conn, backend, prompt_version=PROMPT_VERSION)
+        stats.update(
+            run_enrich(
+                conn,
+                fetcher=fetcher,
+                runner=runner,
+                config=EnrichConfig(max_pages=max_pages or settings.fetch_max_pages),
+                clock=clock,
+                company_ids=company_id or None,
+                limit=limit,
+            )
+        )
+    if stats["llm_problem"]:
+        typer.echo(
+            f"Warning: LLM unavailable ({stats['llm_problem']}); pages were fetched and cached, extraction skipped."
+        )
+    summary = ", ".join(f"{k} {v}" for k, v in sorted(stats["statuses"].items()))
+    typer.echo(f"Enriched {stats['companies']} companies: {summary or 'nothing to do'}")
+    typer.echo(f"HTTP: {stats['requests']} requests, {stats['fetch_cache_hits']} from cache")
+    if stats["median_ms"] is not None:
+        typer.echo(
+            f"Time per company: median {stats['median_ms'] / 1000:.1f}s, max {stats['max_ms'] / 1000:.1f}s"
+        )
+    typer.echo(f"LLM tokens: {stats['prompt_tokens']:,} in, {stats['completion_tokens']:,} out")
+
+
+@app.command()
 def stats(ctx: typer.Context) -> None:
     """Show aggregate counts per table."""
     settings: Settings = ctx.obj
@@ -217,9 +317,30 @@ def stats(ctx: typer.Context) -> None:
         typer.echo("No database yet.")
         return
     conn = db.connect(settings.db_path)
-    for table in ("raw_records", "companies", "market_stats", "http_cache", "runs"):
+    for table in ("raw_records", "companies", "market_stats", "http_cache", "enrichments", "runs"):
         n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         typer.echo(f"{table:12} {n}")
+    for status, n in conn.execute(
+        "SELECT status, COUNT(*) FROM enrichments GROUP BY status ORDER BY status"
+    ):
+        typer.echo(f"  enrich {status:20} {n}")
+    calls = conn.execute(
+        "SELECT latency_ms FROM llm_calls WHERE cache_hit = 0 AND ok = 1 AND latency_ms IS NOT NULL ORDER BY latency_ms"
+    ).fetchall()
+    agg = conn.execute(
+        """SELECT COUNT(*), SUM(cache_hit), SUM(ok = 0), SUM(CASE WHEN cache_hit = 0 THEN prompt_tokens END),
+                  SUM(CASE WHEN cache_hit = 0 THEN completion_tokens END), COUNT(DISTINCT company_id)
+           FROM llm_calls"""
+    ).fetchone()
+    if agg[0]:
+        lat = [r[0] for r in calls]
+        p50 = lat[len(lat) // 2] / 1000 if lat else 0
+        p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] / 1000 if lat else 0
+        per_co = ((agg[3] or 0) + (agg[4] or 0)) / max(agg[5], 1)
+        typer.echo(
+            f"LLM calls {agg[0]} (cache hits {agg[1] or 0}, failed {agg[2] or 0}); latency p50 {p50:.1f}s, "
+            f"p95 {p95:.1f}s; tokens {agg[3] or 0:,} in / {agg[4] or 0:,} out; {per_co:,.0f} tokens per company"
+        )
 
 
 @labels_app.command("split")

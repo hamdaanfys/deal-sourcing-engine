@@ -1,7 +1,8 @@
 """HTTP GET through a SQLite-backed cache, so reruns never repeat a request.
 
-Used by data sources (Census) now and by the website fetcher later. Secrets such as API keys
-are sent with the request but never written into the cache key or the stored URL.
+Used by data sources (Census) and the website fetcher. ``lookup`` never touches the network,
+which lets the fetcher apply robots.txt and rate limits only to real requests. Secrets such as
+API keys are sent with the request but never written into the cache key or the stored URL.
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ import hashlib
 import json
 import sqlite3
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -18,6 +21,10 @@ import httpx
 from dealsource.db import utcnow
 
 SECRET_PARAMS = frozenset({"key", "api_key", "apikey", "token"})
+KEPT_HEADERS = frozenset(
+    {"content-type", "location", "etag", "last-modified", "retry-after", "content-length"}
+)
+TRUNCATED_HEADER = "x-dealsource-truncated"
 
 
 @dataclass(frozen=True)
@@ -30,6 +37,10 @@ class CachedResponse:
 
     def json(self):
         return json.loads(self.body)
+
+    @property
+    def truncated(self) -> bool:
+        return self.headers.get(TRUNCATED_HEADER) == "1"
 
 
 def cache_url(url: str, params: dict[str, str] | None) -> str:
@@ -45,35 +56,72 @@ def is_cacheable(status: int) -> bool:
 
 
 class CachedHttp:
-    def __init__(self, conn: sqlite3.Connection, client: httpx.Client, user_agent: str):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        client: httpx.Client,
+        user_agent: str,
+        *,
+        cacheable: Callable[[int], bool] = is_cacheable,
+    ):
         self.conn = conn
         self.client = client
         self.user_agent = user_agent
+        self.cacheable = cacheable
 
-    def get(
-        self, url: str, params: dict[str, str] | None = None, *, refresh: bool = False
-    ) -> CachedResponse:
+    def lookup(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        *,
+        max_age_seconds: float | None = None,
+    ) -> CachedResponse | None:
         key = cache_url(url, params)
-        if not refresh:
-            row = self.conn.execute(
-                "SELECT status, headers_json, body FROM http_cache WHERE url = ?", (key,)
-            ).fetchone()
-            if row is not None:
-                body = zlib.decompress(row["body"]) if row["body"] is not None else b""
-                return CachedResponse(
-                    key, row["status"], json.loads(row["headers_json"]), body, True
-                )
+        row = self.conn.execute(
+            "SELECT status, headers_json, body, fetched_at FROM http_cache WHERE url = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if max_age_seconds is not None:
+            age = (datetime.now(UTC) - datetime.fromisoformat(row["fetched_at"])).total_seconds()
+            if age > max_age_seconds:
+                return None
+        body = zlib.decompress(row["body"]) if row["body"] is not None else b""
+        return CachedResponse(key, row["status"], json.loads(row["headers_json"]), body, True)
 
-        resp = self.client.get(
-            url, params=params, headers={"User-Agent": self.user_agent}, follow_redirects=False
-        )
-        headers = {
-            k.lower(): v
-            for k, v in resp.headers.items()
-            if k.lower() in {"content-type", "location", "etag", "last-modified"}
+    def fetch(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = None,
+    ) -> CachedResponse:
+        """Make the request (no redirects followed) and cache the response if cacheable."""
+        key = cache_url(url, params)
+        kwargs = {
+            "params": params,
+            "headers": {"User-Agent": self.user_agent},
+            "follow_redirects": False,
         }
-        body = resp.content
-        if is_cacheable(resp.status_code):
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        with self.client.stream("GET", url, **kwargs) as resp:
+            chunks, size, truncated = [], 0, False
+            for chunk in resp.iter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if max_bytes is not None and size > max_bytes:
+                    truncated = True
+                    break
+            body = b"".join(chunks)
+            if max_bytes is not None:
+                body = body[:max_bytes]
+            headers = {k.lower(): v for k, v in resp.headers.items() if k.lower() in KEPT_HEADERS}
+            if truncated:
+                headers[TRUNCATED_HEADER] = "1"
+            status = resp.status_code
+        if self.cacheable(status):
             with self.conn:
                 self.conn.execute(
                     """INSERT INTO http_cache (url, final_url, status, headers_json, body, content_hash, fetched_at)
@@ -84,11 +132,20 @@ class CachedHttp:
                     (
                         key,
                         key,
-                        resp.status_code,
+                        status,
                         json.dumps(headers, sort_keys=True),
                         zlib.compress(body),
                         hashlib.sha256(body).hexdigest(),
                         utcnow(),
                     ),
                 )
-        return CachedResponse(key, resp.status_code, headers, body, False)
+        return CachedResponse(key, status, headers, body, False)
+
+    def get(
+        self, url: str, params: dict[str, str] | None = None, *, refresh: bool = False
+    ) -> CachedResponse:
+        if not refresh:
+            hit = self.lookup(url, params)
+            if hit is not None:
+                return hit
+        return self.fetch(url, params)

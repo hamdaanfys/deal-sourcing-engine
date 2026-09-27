@@ -493,6 +493,67 @@ exported. Masking is applied on write to `enrichments` and carries a `MASK_VERSI
 biased toward over-masking. It's tested against a synthetic table of positive and negative
 cases.
 
+### 8.5 Output checks: cleanup and grounding (added after the first live run)
+
+The first live run on five real companies showed that a 7B model fills optional fields with
+filler and invents numbers. In one run it gave three employee counts (1,000, 100 and 1,000)
+with quotes like "10,000+ projects around the world"; the word "employees" did not appear on one
+of those sites at all. So after schema validation and before masking, two deterministic passes
+run (`enrich/schema.py`). They apply to cached answers too, so changing them never needs new
+LLM calls.
+
+1. **Cleanup** (`normalize_extraction`):
+   - filler strings ("unknown", "n/a", …) become null
+   - `employee_count_quote` is cleared when there's no count
+   - list items are deduplicated (case-insensitive) and capped at 10
+   - the summary is trimmed to two sentences
+2. **Grounding** (`ground_extraction`) against the exact text the model saw:
+   - evidence quotes must appear verbatim (ignoring case and whitespace)
+   - an employee count needs a verbatim quote that contains that number and a workforce word
+     (employees, staff, team, people, workforce, …)
+   - founded year and square footage must appear as numbers in the text
+   - evidence citing a field that was dropped is dropped too
+
+   Whatever is removed is listed in `enrichments.detail` (e.g.
+   `unsupported by page text: employee_count`).
+
+### 8.6 Implementation notes (Phase 3)
+
+- **Modules**: `enrich/fetcher.py`, `enrich/extract.py`, `enrich/schema.py`,
+  `enrich/prompts.py`, `enrich/mask.py`, `enrich/pipeline.py`, `llm/base.py`,
+  `llm/ollama.py`, `llm/cache.py`, plus `clock.py` (injectable time) and `privacy.py` (shared
+  email/phone scrubbing).
+- **robots.txt** follows RFC 9309: a 4xx means allow all; a 5xx or an unreachable file means
+  disallow all. A `Crawl-delay` above 30 s makes us skip the site (`crawl_delay_too_long`)
+  rather than wait.
+- **Homepage**: we try `https://domain/`, `https://www.domain/`, then `http://domain/`.
+- **Page selection**: include/skip keywords match at the start of a word, so "Steam Boilers"
+  isn't skipped as "team". `governance` pages (board lists) are skipped.
+- **Sequential**: companies and pages are fetched one at a time. The 4-host concurrency in
+  §8.1 isn't implemented yet; with a 2 s minimum delay (10 s for sites that ask), fetching takes
+  2–60 s per company.
+- **Contact scrubbing**: emails and phone numbers only. Street addresses aren't scrubbed
+  (company addresses aren't personal data, and contact pages are never fetched).
+- **LLM interface**: `LLMBackend.check()` plus `chat(messages, schema, options)`, rather than
+  `generate_structured(system, user, …)`, so the invalid-JSON retry can send the bad reply back
+  with a "fix it" message.
+- **Ollama down**: the run still fetches and caches every site, and marks companies
+  `llm_unavailable`. A later run reuses the cached pages. If Ollama stops mid-run, remaining
+  companies skip the LLM instead of each waiting for a timeout.
+- **Statuses** in `enrichments.status`: `ok`, `no_website`, `blocked_by_robots`,
+  `crawl_delay_too_long`, `offsite_redirect`, `http_error`, `timeout`, `connection_error`,
+  `not_html`, `too_large`, `no_text`, `llm_unavailable`, `llm_timeout`, `llm_invalid_output`,
+  `llm_error`, `error`.
+- **Not yet implemented**: `--remask` (re-masking from the cache) and the Ollama model digest
+  in the cache key. The cache key uses the model name.
+- **Observed on this machine** (demo, 2026-09-27, 5 small public manufacturers):
+  - LLM time: 25–70 s per company, 1–5k prompt tokens.
+  - Fetch time: 2–61 s per company.
+  - A rerun takes under 0.5 s in total, with no HTTP requests and no LLM calls.
+  - Weak spots of the 7B model: it invents employee counts (now blocked by grounding) and it
+    marks ownership inconsistently. One site's evidence said "NSYS (NASDAQ)" but
+    `publicly_traded` came back `unknown`.
+
 ## 9. Stage 4: Score
 
 ### 9.1 Thesis YAML (`examples/thesis.example.yaml`)
@@ -857,3 +918,4 @@ component (after v1).
 | 2026-09-27 | Platform and shared-hosting URLs (Facebook, LinkedIn, Yelp, wixsite, godaddysites, business.site, PSL private-section hosts, …) count as "no website"; `www.` and subdomains normalize to the registrable domain (§7.1). |
 | 2026-09-27 | Different domains still never auto-merge, but same name + same location + different domains is flagged for review (`different_domains`) (§7.2). |
 | 2026-09-27 | `labels split` implemented: prints counts only (total, and pursue/pass for dev and test); rounds half up; the manifest also stores the decisions at split time (§11.3). |
+| 2026-09-27 | Phase 3 (enrich) implemented. LLM output is cleaned up and grounded against the page text after validation; unsupported numbers and quotes are dropped (§8.5). Fetching is sequential for now (§8.6). |
