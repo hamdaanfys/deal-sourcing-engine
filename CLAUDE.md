@@ -22,6 +22,9 @@ The firm's thesis, target lists, labels, outputs and database are confidential.
   Never use `git add -f` on them, and never edit `.gitignore` to un-ignore them.
 - Stage files by explicit path. Don't use `git add -A`, `git add .` or `git commit -a`. Run
   `git status` and check the staged list before every commit.
+- **Never use `--no-verify`** (or any other way of skipping hooks). The pre-commit hook in
+  `.githooks/` blocks confidential files. If it rejects a commit, unstage the flagged files
+  and tell the user; don't work around it.
 - Don't open, read, grep or print files under `private/` or `.env` unless the user explicitly
   asks for it in that session. Don't copy their contents into code, tests, fixtures, docs,
   commit messages or examples.
@@ -30,6 +33,16 @@ The firm's thesis, target lists, labels, outputs and database are confidential.
 - Default paths for the DB, caches, logs, exports, real theses and overrides all point under
   `private/`. Don't add defaults that write data into tracked directories.
 - `.env.example` documents variables with empty or placeholder values only.
+
+## Evaluation discipline
+
+- **Never run `dealsource eval --set test --final`, and never use test-split labels for
+  tuning** (weights, thresholds, keywords, exclusions, prompts), unless the user explicitly asks
+  in that session. Tune only against the dev set. The held-out test set is evaluated once, at
+  the end (DESIGN.md §11.4).
+- **Never print company-level eval results in a session**: no per-company scores, labels,
+  disagreements or rows from `private/evals/`. Report aggregate metrics only. Company-level
+  files are for the user to review.
 
 ## Data and privacy rules
 
