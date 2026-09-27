@@ -59,13 +59,15 @@ deal-sourcing-engine/
 │   ├── config.py                 # settings from .env + defaults; path resolution for private/
 │   ├── db.py                     # SQLite connection, migrations, small repository helpers
 │   ├── models.py                 # Pydantic models shared across stages
+│   ├── httpcache.py              # cached HTTP GET (SQLite http_cache), shared by sources + fetcher
 │   ├── sources/
 │   │   ├── base.py               # CompanySource / MarketDataSource protocols + registry
 │   │   ├── csv_source.py
 │   │   └── census_cbp.py
 │   ├── resolve/
 │   │   ├── normalize.py          # name + domain normalization
-│   │   └── matcher.py            # blocking, fuzzy scoring, clustering
+│   │   ├── matcher.py            # blocking, pair rules, union-find clustering
+│   │   └── pipeline.py           # load records, overrides, canonical records, stable IDs, review file
 │   ├── enrich/
 │   │   ├── fetcher.py            # robots.txt, rate limiting, HTTP cache
 │   │   ├── extract.py            # HTML → clean text, page selection, contact-info scrubbing
@@ -131,7 +133,7 @@ deal-sourcing-engine/
 
 ```
 DEALSOURCE_DATA_DIR=private
-CENSUS_API_KEY=                     # optional; CBP works without a key at low volume
+CENSUS_API_KEY=                     # required: the Census API now rejects keyless requests
 DEALSOURCE_USER_AGENT_CONTACT=      # URL or mailbox that site owners can contact; required for enrich
 OLLAMA_HOST=http://127.0.0.1:11434
 LLM_BACKEND=ollama
@@ -171,11 +173,14 @@ There are two kinds of source, because they produce different things:
 
 ```python
 class CompanySource(Protocol):
-    name: str                                   # "csv", later "state_registry", ...
+    name: str  # "csv", later "state_registry", ...
+
     def iter_records(self) -> Iterator[RawCompanyRecord]: ...
 
+
 class MarketDataSource(Protocol):
-    name: str                                   # "census_cbp"
+    name: str  # "census_cbp"
+
     def fetch(self, naics: list[str], geos: list[GeoSpec], year: int) -> Iterator[MarketStat]: ...
 ```
 
@@ -191,8 +196,17 @@ later stages.
 - **Revenue comes only from CSV.** If a CSV supplies a revenue column, it's stored in
   `revenue_usd_m` (the unit is declared in the mapping, e.g. `--revenue-unit usd|usd_k|usd_m`).
   No other source, including the LLM, produces revenue.
-- It drops and warns about columns that look like personal contact info (email, phone,
-  contact name, LinkedIn URLs), so they never enter the DB. See §12.
+- It drops and warns about columns that look like personal contact info, so they never enter
+  the DB (§12). A column is dropped if **either**:
+  - its header contains a contact word (email, phone, tel, mobile, cell, fax, contact,
+    linkedin, person, ceo, president, street, address, zip, postal) or pair
+    (first/last/full/owner name). Headers are split into words, so "Service Offerings" is not
+    mistaken for "ceo"; or
+  - at least half of its non-empty values are *entirely* an email, a phone number (separators
+    required, so bare revenue figures don't count) or a personal LinkedIn URL.
+
+  Mapping a dropped column with `--map` is an error. Emails and phone numbers inside kept
+  free-text columns (notes, description) are replaced with `[removed]`.
 - `source_record_id` is the value of a configured ID column, or else a hash of the normalized row.
 
 ### 6.2 Census County Business Patterns source
@@ -202,11 +216,25 @@ establishment counts by employee-size class. It therefore feeds `market_stats`, 
 `raw_records`, and is used for market sizing per thesis sector and geography, reported
 alongside the export. **In v1, CBP data is report-only: it never affects scores.**
 
-Implementation: `GET https://api.census.gov/data/{year}/cbp` with `get=ESTAB,EMP,PAYANN,...`,
-`for=state:*` or `county:*&in=state:XX`, and `NAICS2017=...`. The field names and NAICS
-vintage vary by year, so the adapter keeps a small per-year mapping table. Responses go
-through the same HTTP cache as website fetches, and the Census API key comes from `.env` when
-set.
+Implementation (`sources/census_cbp.py`): one request per NAICS code × geography to
+`GET https://api.census.gov/data/{year}/cbp` with
+`get=NAME,NAICS2017,NAICS2017_LABEL,EMPSZES,EMPSZES_LABEL,ESTAB,EMP,EMP_N,PAYANN`,
+`for=us:1`, `state:13,37` or `county:*` + `in=state:13`, and `NAICS2017=<code>`.
+- **Years**: the per-year mapping table covers 2017–2023, all of which use `NAICS2017`
+  (checked against each year's public `variables.json`). Other years are rejected with a clear
+  error.
+- **Rows**: the `EMPSZES=001` ("all establishments") row gives the totals. Any size-class rows
+  in the response are folded into `size_classes`, and rows for a specific legal form (`LFO` other
+  than `001`) are ignored. The request doesn't set an `EMPSZES` predicate, so the API returns
+  its default. Whether that default includes the size-class breakdown hasn't been checked
+  against a live keyed response yet.
+- **API key required**: as of 2026-09 the API redirects keyless requests to a `missing_key`
+  page, so `CENSUS_API_KEY` must be set. The adapter reports that as a clear error.
+- **Caching**: responses go through `dealsource/httpcache.py` (the SQLite `http_cache`
+  shared with the website fetcher). The API key is sent but never written into the cache key
+  or stored URL. 2xx (including 204, "no data") and 404 responses are cached; redirects and
+  errors aren't, so a corrected key or a retry works.
+- **CLI output**: `ingest cbp` prints the (public) market totals per NAICS × geography.
 
 ## 7. Stage 2: Resolve (entity resolution)
 
@@ -214,39 +242,97 @@ Goal: merge the raw records that refer to the same real company into one `compan
 without merging distinct companies.
 
 ### 7.1 Normalization
-- **Name key**: Unicode NFKC, lowercase, `&`→`and`, strip punctuation, drop legal suffixes
-  (inc, incorporated, llc, l.l.c., corp, corporation, co, company, ltd, lp, llp, plc, pllc,
-  holdings, group†), and collapse whitespace. Keep both the full normalized name and the
-  suffix-stripped key. (†"group" and "holdings" are stripped only for matching, never for
-  display.)
+- **Name key** (`resolve/normalize.py`): ASCII-fold accents, lowercase, `&`/`+`→`and`, drop
+  periods (so `L.L.C.`→`llc`, `Mfg.`→`mfg`), split into words, expand common abbreviations
+  (mfg→manufacturing, intl→international, svcs→services, bros→brothers, …), drop trailing
+  legal suffixes (inc, incorporated, llc, corp, corporation, co, company, ltd, limited, lp, llp,
+  plc, pllc, holdings, group) and a leading "the", then singularize simple plurals
+  (tools→tool, industries→industry). If a name is nothing but suffixes, it keeps them rather
+  than becoming empty. The display name is never changed. Example: "Acme Mfg. LLC" and
+  "ACME Manufacturing, Inc." both become `acme manufacturing`.
 - **Domain key**: parse the URL, lowercase, strip scheme, `www.`, path and port, and reduce to
-  the registrable domain (eTLD+1) using `tldextract` **with its bundled suffix list and network
-  refresh disabled**, which keeps tests offline and runs deterministic. Generic domains
-  (facebook.com, linkedin.com, gmail.com, …) are blocklisted so they can't act as a shared
-  key. On shared-hosting platforms (wixsite.com, squarespace.com, …) the full host is kept
-  instead of eTLD+1.
+  the registrable domain (eTLD+1) using `tldextract` **with its bundled suffix list, no network
+  refresh and no disk cache**, which keeps tests offline and runs deterministic. The PSL's
+  private section is included, so `acme.wixsite.com` stays a full host. Our own
+  shared-hosting list does the same for builders the PSL doesn't cover (squarespace.com,
+  weebly.com, business.site, …). Generic domains (facebook.com, linkedin.com, gmail.com, …)
+  and email addresses give no key, so they can't act as a shared identifier. A suffix that
+  isn't on the list at all (e.g. the reserved `.test` TLD used in fixtures) falls back to the
+  last two labels.
+- **Location**: US state names → USPS codes, city lowercased with St./Ft. expanded, and
+  country variants (USA, United States, …) → `US`.
 
 The same normalization is used to key labels (§11.2).
 
-### 7.2 Matching
-1. **Blocking**, to avoid O(n²) comparisons: candidate pairs share a domain key, or share the
-   first name-key token plus state, or a sorted-token prefix.
-2. **Pair scoring** (`rapidfuzz`):
-   - same domain key → match (strong evidence), unless the names are wildly different
-     (score < 50), in which case the pair is flagged for review
-   - different, non-empty domain keys → **never** auto-merge (a hard negative)
-   - otherwise use `token_sort_ratio` and `partial_ratio` on the name keys, plus agreement on
-     city/state. Auto-merge at ≥ 93 with a location match, flag 85–93 as a "possible match",
-     and treat anything lower as distinct. The thresholds live in config.
-3. **Clustering**: union-find over the auto-merge edges. A cluster can't contain two
-   different domain keys; if it would, the weakest edge is cut.
-4. **Canonical record**: prefer values from the most trusted source (configurable source
-   priority), then the most complete record.
-5. **Overrides**: `private/overrides.yaml` holds analyst-forced `merge` and `split` pairs,
-   which are applied after automatic matching. `dealsource resolve --review` writes the
-   "possible match" pairs to `private/review/possible_matches.csv` and prints only the count.
+### 7.2 Matching (`resolve/matcher.py`)
+1. **Blocking**, to avoid O(n²) comparisons: two records are compared only if they share a
+   domain key, the first word of the name key, or the first four characters of the name key
+   with spaces removed (this catches typos after the first few letters). Name blocks with more
+   than 2,000 records are skipped and counted, which stops a very common first word from
+   blowing up the pair count.
+2. **Pair rules**, applied in order:
+   - **Both have a domain and it's the same → merge**, whatever the names say. A company's own
+     website is the strongest identifier we have (e.g. "Blue Ridge Fabrication" and "BRF
+     Industrial Services" on the same domain). If the name similarity is below 50, the merge
+     still happens but is also listed in the review file.
+   - **Both have a domain and they differ → never merged**, even with identical names.
+   - **Otherwise (at least one record has no website)**, compare names and location. Name
+     similarity is `rapidfuzz.token_sort_ratio` on the name keys (0–100), or 100 if the keys
+     are equal once spaces are removed ("metal works" vs "metalworks"). Location is `match`
+     (same state; cities agree or one is missing), `partial` (same state, different cities),
+     `conflict` (different state or country) or `unknown` (a state is missing).
+     - similarity ≥ **93** and location `match` → **merge**
+     - similarity ≥ 93 but location `partial`, `conflict` or `unknown` → **review only**
+     - similarity **85**–93 → **review only**
+     - below 85 → **different companies**
+3. **Why these thresholds.** They were set by measuring `token_sort_ratio` on realistic pairs
+   after normalization:
+   - Same company, typo or plural: "carolina valve(s)" 96.6, "acme manufacturing" vs
+     "acme manufacturng" 97.1, "acme tool(s)" 94.7. Abbreviation and suffix variants
+     normalize to identical keys (100).
+   - Different companies that differ by one word: "delta machine" vs "delta marine" 88.0,
+     "precision machining" vs "precision machine" 88.9, "blue ridge fabrication" vs
+     "blue ridge fabricators" 90.9 (ambiguous).
+   - Clearly different: "apex tool" vs "ajax tool" 77.8; "southern precision machining" vs
+     "northern precision machining" 67.9, because sorting the words separates the
+     distinguishing one.
 
-Every merge stores its evidence (method, scores, fields that agreed) in `company_records`.
+   So 93 sits above the whole ambiguous zone (88–91) and below the typo and plural zone
+   (94–100), and 85 catches the one-word-difference cases for a human decision instead of
+   silently dropping them. A wrong merge corrupts a target's data invisibly, while a missed
+   merge only shows up as a visible duplicate, so every ambiguous case goes to review rather
+   than auto-merge. For the same reason a name match alone is never enough: the location has
+   to agree too. `partial_ratio` and `token_set_ratio` are deliberately not used, because they
+   score "summit hvac" vs "summit hvac services" as 100.
+
+   The thresholds are constants in `matcher.py` (`AUTO_MERGE`, `REVIEW`,
+   `DOMAIN_NAME_MISMATCH`). They'll be revisited against the dev labels, never the test set.
+4. **Clustering**: union-find over the accepted merges, taken strongest first (analyst
+   overrides, then domain matches, then name matches by score). A merge is refused if it
+   would put two different domains, or an analyst "split" pair, in the same company. For
+   example, a website-less record can't bridge two companies with different domains. Refused
+   merges are listed in the review file. Taking the strongest evidence first means the weakest
+   link is the one that gets cut.
+5. **Canonical record**: records are ordered by source priority
+   (`DEALSOURCE_SOURCE_PRIORITY`, default `csv`), then completeness, then age. The name comes
+   from the first record; domain, country and revenue are the first non-empty value; city and
+   state come together from the first record that has a state; NAICS codes are the union; the
+   employee count comes from the first record that has one, and its source is recorded.
+6. **Stable IDs**: resolution is recomputed from scratch on each run (it's fast), but each
+   cluster reuses the oldest company ID any of its records already had. IDs survive reruns and
+   new data, which later stages (the enrichment cache, scores) rely on. Companies left with no
+   records are deleted.
+7. **Overrides**: `private/overrides.yaml` holds analyst `merge` and `split` pairs of record
+   refs (`source:source_record_id`). Merges override domain conflicts; splits override
+   everything; a pair that's in both is an error. Refs that don't exist are counted and
+   reported.
+8. **Review**: `dealsource resolve --review` writes `private/review/possible_matches.csv`
+   with three kinds of row: `possible_match` (review-only pairs that ended up in different
+   companies), `merged_on_domain` (same domain, names differ) and `merge_blocked` (refused by a
+   constraint). The terminal shows only counts.
+
+Every merge stores its evidence in `company_records`: method (`domain`, `name_location`,
+`override`, or `singleton`), name similarity, the other record's ref, and the reason.
 
 ## 8. Stage 3: Enrich
 
@@ -292,17 +378,20 @@ Every merge stores its evidence (method, scores, fields that agreed) in `company
 ```python
 @dataclass
 class LLMResult:
-    data: dict            # parsed JSON matching the schema
+    data: dict  # parsed JSON matching the schema
     model: str
     prompt_tokens: int
     completion_tokens: int
     latency_ms: float
     cache_hit: bool
 
+
 class LLMBackend(Protocol):
     name: str
-    def generate_structured(self, *, system: str, user: str,
-                            schema: dict, options: GenOptions) -> LLMResult: ...
+
+    def generate_structured(
+        self, *, system: str, user: str, schema: dict, options: GenOptions
+    ) -> LLMResult: ...
 ```
 
 **Ollama backend**: `POST {OLLAMA_HOST}/api/chat` with `stream: false`,
@@ -317,28 +406,34 @@ documenting it.
 
 ```python
 class Extraction(BaseModel):
-    summary: str                                  # ≤ 2 sentences, what the company does
+    summary: str  # ≤ 2 sentences, what the company does
     product_lines: list[str]
-    end_markets: list[str]                        # industries/customers served
-    business_model: Literal["manufacturer","distributor","services","software","mixed","unknown"]
+    end_markets: list[str]  # industries/customers served
+    business_model: Literal[
+        "manufacturer", "distributor", "services", "software", "mixed", "unknown"
+    ]
     size_signals: SizeSignals
     ownership: OwnershipSignals
-    evidence: list[Evidence]                      # short quotes backing key claims (page path + quote)
+    evidence: list[Evidence]  # short quotes backing key claims (page path + quote)
+
 
 class SizeSignals(BaseModel):
-    employee_count: int | None                    # only if the site states a number/range
+    employee_count: int | None  # only if the site states a number/range
     employee_count_quote: str | None
-    facility_count: int | None                    # plants, branches, service locations
+    facility_count: int | None  # plants, branches, service locations
     facility_sqft_total: int | None
     founded_year: int | None
     # deliberately no revenue field: revenue comes only from CSV inputs (§6.1)
 
+
 class OwnershipSignals(BaseModel):
-    founder_led: Literal["yes","no","unknown"]
-    family_owned: Literal["yes","no","unknown"]
-    generation: int | None                        # "third-generation family business" → 3
-    pe_or_strategic_backed: Literal["yes","no","unknown"]   # "a portfolio company of…", "part of …"
-    publicly_traded: Literal["yes","no","unknown"]
+    founder_led: Literal["yes", "no", "unknown"]
+    family_owned: Literal["yes", "no", "unknown"]
+    generation: int | None  # "third-generation family business" → 3
+    pe_or_strategic_backed: Literal[
+        "yes", "no", "unknown"
+    ]  # "a portfolio company of…", "part of …"
+    publicly_traded: Literal["yes", "no", "unknown"]
 ```
 
 The schema has **no fields for people's names, titles, emails or phone numbers**. Ownership is
@@ -549,7 +644,7 @@ Order of operations:
 - The command prints aggregate counts only (per split × decision), never keys or names.
 
 **Pipeline gating**: `ingest`, `resolve`, `enrich`, `score`, `run` and `eval` refuse to start
-while `private/labels_split.json` is missing. That covers both the case where `labels.csv`
+(exit code 2) while `private/labels_split.json` is missing. That covers both the case where `labels.csv`
 hasn't been created yet and the case where it exists but hasn't been split. The error message
 gives the next step. The check applies to the configured data dir, so tests and demos with
 their own temporary data dir (and synthetic labels and split) aren't affected.
@@ -728,3 +823,5 @@ component (after v1).
 | 2026-09-27 | Labels are binary (pursue/pass) only. |
 | 2026-09-27 | HTML text extraction uses `selectolax`. |
 | 2026-09-27 | A tracked pre-commit hook (`.githooks/pre-commit`) blocks `private/`, `.env*` (except `.env.example`) and DB files. It's enabled per clone with `git config core.hooksPath .githooks` (§4.2). |
+| 2026-09-27 | Entity resolution: same domain always merges (listed for review if names differ); different domains never merge; otherwise name similarity ≥ 93 **and** matching location merges, 85–93 or a location mismatch goes to review (§7.2). |
+| 2026-09-27 | The Census API now requires `CENSUS_API_KEY`. The CBP adapter supports 2017–2023 (`NAICS2017`) (§6.2). |

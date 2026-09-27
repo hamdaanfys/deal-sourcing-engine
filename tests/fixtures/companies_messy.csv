@@ -1,0 +1,5 @@
+Company Name,Website,City,ST,Employees,Revenue ($M),Primary Contact,Contact Email,Phone,Misc,Notes,Ownership
+Acme Mfg. LLC,https://www.acme-mfg.test,Macon,GA,85,12.5,Pat Example,pat@acme-mfg.test,(478) 555-0101,pat@acme-mfg.test,Call 478-555-0101 or write sales@acme-mfg.test,family
+Bluegrass Precision Tooling Inc.,bluegrassprecision.test,Lexington,Kentucky,40-60,,Sam Sample,sam@bluegrass.test,859.555.0142,sam@bluegrass.example.com,Second-generation shop,founder
+Harbor Line Fabricators,,Savannah,GA,"1,200",75,Lee Placeholder,lee@harbor.test,912-555-0199,,,
+,https://no-name.test,Atlanta,GA,10,,,,,,Row without a company name,

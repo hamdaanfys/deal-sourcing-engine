@@ -82,10 +82,12 @@ The firm's thesis, target lists, labels, outputs and database are confidential.
 
 ## Commands
 
-(Filled in once the project is scaffolded.)
+```
+.venv/bin/pip install -e ".[dev]"     # install
+.venv/bin/pytest                      # full offline test suite
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+.venv/bin/dealsource --help
+```
 
-```
-pytest
-ruff check .
-dealsource --help
-```
+Never run `dealsource` pipeline commands against the real data dir (`private/`) unless the
+user asks. Tests use temporary data dirs.
