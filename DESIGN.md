@@ -21,18 +21,28 @@ Non-goals: a CRM, a UI, contact discovery, or any collection of personal contact
 ## 2. Pipeline overview
 
 ```
- sources ──► ingest ──► raw_records ──► resolve ──► companies ──► enrich ──► enrichments
- (CSV, CBP, …)                          (entity                  (fetch site,
-                                         resolution)              extract text,
-                                                                  local LLM)
-                                                                      │
- thesis.yaml ─────────────────────────────────────────────► score ◄──┘
+  BEFORE THE LABELS SPLIT
+  discover (SAM.gov, USAspending) ─┐
+  ingest (CSV, Census CBP) ────────┴─► raw_records ─► resolve ─► companies
+                                                                    │
+  thesis.yaml ──► labels export ──► private/to_label.csv ◄──────────┘
+                                          │ analyst fills in decisions
+                                          ▼
+                  private/labels.csv ──► labels split (once) ──► labels_split.json
+
+  AFTER THE SPLIT
+  companies ─► enrich (fetch site, extract text, local LLM) ─► enrichments
+                                                                    │
+  thesis.yaml ─────────────────────────────────────────────► score ◄┘
                                                                │
                                                             export ──► ranked CSV
                                                                │
- labels.csv ──► labels split (once, before any run) ──────► eval ──► aggregate metrics (terminal)
+  labels + split ──────────────────────────────────────────► eval ──► aggregate metrics (terminal)
                                                                   └─► company-level file (private/)
 ```
+
+Discovery, ingest, resolve and the labeling export run **before** the labels split. Enrich,
+score, export and eval run only **after** it (§11.3).
 
 Each stage is a separate CLI command that reads from and writes to SQLite. Stages are
 **idempotent** and **incremental**: rerunning a stage only does work for new or changed
@@ -63,7 +73,9 @@ deal-sourcing-engine/
 │   ├── sources/
 │   │   ├── base.py               # CompanySource / MarketDataSource protocols + registry
 │   │   ├── csv_source.py
-│   │   └── census_cbp.py
+│   │   ├── census_cbp.py
+│   │   ├── sam_extract.py        # SAM.gov public monthly entity extract (discovery)
+│   │   └── usaspending.py        # USAspending contract recipients (discovery)
 │   ├── resolve/
 │   │   ├── normalize.py          # name + domain normalization
 │   │   ├── matcher.py            # blocking, pair rules, union-find clustering
@@ -82,6 +94,7 @@ deal-sourcing-engine/
 │   │   ├── thesis.py             # thesis YAML schema (Pydantic) + loader
 │   │   └── scorer.py             # component scores, exclusions, written reasons
 │   ├── eval/
+│   │   ├── label_export.py       # sample candidates to private/to_label.csv for labeling
 │   │   ├── labels.py             # load + validate labels.csv, match labels to companies
 │   │   ├── split.py              # one-time grouped, stratified dev/test split + manifest
 │   │   └── metrics.py            # aggregate metrics; company-level report writer
@@ -103,7 +116,9 @@ deal-sourcing-engine/
 | Example thesis, synthetic sample CSV | `examples/` | yes |
 | Real thesis(es) | `private/theses/*.yaml` | **no** |
 | Real target lists / CRM exports | `private/inputs/` | **no** |
+| Sample to label (exported) | `private/to_label.csv` | **no** |
 | Analyst labels | `private/labels.csv` | **no** |
+| SAM.gov extract ZIPs | `private/cache/sam/` | **no** |
 | Dev/test split record (manifest + assignments) | `private/labels_split.json` | **no** |
 | Evaluation log and company-level eval reports | `private/evals/` | **no** |
 | SQLite DB (includes all caches) | `private/dealsource.db` | **no** (also `*.db` is ignored) |
@@ -134,6 +149,8 @@ deal-sourcing-engine/
 ```
 DEALSOURCE_DATA_DIR=private
 CENSUS_API_KEY=                     # required: the Census API now rejects keyless requests
+SAM_API_KEY=                        # free personal key from SAM.gov (see README)
+SAM_DAILY_REQUEST_BUDGET=8          # stay under SAM.gov's 10 requests/day without a role
 DEALSOURCE_USER_AGENT_CONTACT=      # URL or mailbox that site owners can contact; required for enrich
 OLLAMA_HOST=http://127.0.0.1:11434
 LLM_BACKEND=ollama
@@ -236,6 +253,76 @@ Implementation (`sources/census_cbp.py`): one request per NAICS code × geograph
   errors aren't, so a corrected key or a retry works.
 - **CLI output**: `ingest cbp` prints the (public) market totals per NAICS × geography.
 
+### 6.3 Discovery: SAM.gov and USAspending (`discover`)
+
+Discovery finds candidate companies in free public sources whose terms allow automated
+access. It uses the same `raw_records` → `resolve` path as every other source. The two sources
+were chosen after comparing SAM.gov, USAspending, OpenStreetMap/Overpass, the SBA Small
+Business Search, and state and trade directories:
+- **Overpass:** its public instance asks commercial users to self-host, and it has no NAICS
+  codes.
+- **SBA search:** it has no official API.
+- **State and trade directories:** most don't allow scraping and each has its own format.
+
+Lists you're licensed to use still come in through `ingest csv`.
+
+**SAM.gov public monthly entity extract** (`sources/sam_extract.py`, `dealsource discover sam`)
+- **Download:** one request, `GET https://api.sam.gov/data-services/v1/extracts?api_key=…&fileType=ENTITY&sensitivity=PUBLIC&frequency=MONTHLY&charset=UTF8&date=MM/YYYY`,
+  returns the whole public file as a ZIP. We make 1 request per month; the limit without a
+  SAM.gov role is 10 a day.
+  - A per-day counter (`api_usage`) refuses past `SAM_DAILY_REQUEST_BUDGET` (default 8).
+  - The ZIP is kept at `private/cache/sam/`, so re-running reuses it with no request.
+  - The API key is sent as the query parameter SAM.gov requires. It is never logged, stored
+    in the DB or put in a cache key.
+  - `--file` accepts a ZIP you downloaded by hand.
+- **File format:** pipe-delimited `.dat`, 142 columns per record, each ending `!end`, with
+  BOF/EOF lines. Column positions come from "SAM Master Extract Mapping v6.0 Public File V2
+  Layout". We read only:
+
+  | Column | Field |
+  |---|---|
+  | 1 | UEI |
+  | 6 | Extract code |
+  | 7 | Purpose of registration |
+  | 9, 10 | Expiration date, last update date |
+  | 12, 13 | Legal name, DBA name |
+  | 18, 19, 20, 22 | City, state, ZIP, country |
+  | 24 | D&B Open Data flag |
+  | 27 | Entity URL |
+  | 33, 35 | Primary NAICS, NAICS list (`333611Y~…`, each with an SBA small-business flag) |
+  | 116 | Exclusion flag |
+  | 119 | No-public-display flag |
+
+  The point-of-contact columns (47–112: people's names, titles, addresses) are never read.
+- **Records kept:** active registrations (`A`) that aren't marked no-public-display (`NPDY`)
+  or excluded/debarred (`D`), are in the US, are in a thesis state, and have any NAICS code
+  under a thesis prefix.
+  - D&B-sourced records last updated before 2022-04-04 are skipped, because they fall under
+    SAM.gov's D&B terms.
+  - The UEI goes in `extra.uei` and becomes the record ID.
+- **Month:** by default, the newest file (they're generated on the first Sunday of each
+  month). `--month MM/YYYY` picks another.
+
+**USAspending federal contract recipients** (`sources/usaspending.py`, `dealsource discover usaspending`)
+- No API key. The source uses `POST /api/v2/search/spending_by_category/recipient/`, one row
+  per recipient with UEI and total obligations, with these filters:
+  - contracts (award types A–D)
+  - `naics_codes.require` = the thesis prefixes
+  - recipient location = each thesis state
+  - the last 5 federal fiscal years, including the current one
+- Requests are 100 per page, at most 50 pages per state, and at least 1 s apart. POST bodies
+  are cached (`CachedHttp.post_json`), so a rerun makes no requests.
+- These records have **no website and no city**. They join the matching SAM.gov record by UEI
+  during resolution (§7.2), which supplies both. They also add a federal-contract revenue
+  signal (`extra.federal_contract_obligations_usd`).
+
+**Limitation: coverage skews toward federal contractors.** SAM.gov and USAspending only
+contain companies registered to do business with the federal government. So candidates skew
+toward industrial, defense and government suppliers, and consumer-facing companies (food and
+beverage brands, consumer products, retail-oriented manufacturers) are under-represented. The
+labeling sample and every metric built on it inherit this skew. Fill gaps with lists you're
+licensed to use via `ingest csv`.
+
 ## 7. Stage 2: Resolve (entity resolution)
 
 Goal: merge the raw records that refer to the same real company into one `companies` row,
@@ -281,6 +368,9 @@ The same normalization is used to key labels (§11.2).
    than 2,000 records are skipped and counted, which stops a very common first word from
    blowing up the pair count.
 2. **Pair rules**, applied in order:
+   - **Same SAM.gov UEI → merge**, whatever the names or domains say. It's the same federal
+     registration, and this is how USAspending records join SAM records. UEI merges outrank
+     domain merges and aren't blocked by a domain difference.
    - **Both have a domain and it's the same → merge**, whatever the names say. A company's own
      website is the strongest identifier we have (e.g. "Blue Ridge Fabrication" and "BRF
      Industrial Services" on the same domain). If the name similarity is below 50, the merge
@@ -645,6 +735,33 @@ label or split information.
 
 ## 11. Evaluation against analyst labels
 
+### 11.0 Export for labeling (`dealsource labels export`)
+
+`dealsource labels export --thesis PATH [--n 200] [--per-state-cap N] [--seed 20260927]`
+writes `private/to_label.csv` (`eval/label_export.py`).
+
+- **Columns:** exactly `company_name, website, state, decision`, with `decision` empty. There
+  are no scores, summaries, NAICS codes, sources or anything else the pipeline produces, so
+  labels aren't influenced by the tool. The headers match `labels.csv`, so the filled file is
+  saved as `private/labels.csv`.
+- **Eligible companies:** resolved companies with a website (enrichment needs one), a state in
+  the thesis, a NAICS code under a thesis prefix, and a US or unknown country. Companies whose
+  label key is already in `labels.csv` are skipped.
+- **Sample:** spread across states. Each state's companies are shuffled with the seed, then
+  picked round-robin across states (alphabetical) until `n` companies are picked, every state
+  reaches `per_state_cap`, or the candidates run out. The default cap is 1.5 × an even share,
+  so big states can fill in for small ones without dominating. Rows are sorted by name.
+- **Safety and output:**
+  - It refuses if `to_label.csv` already exists (never overwrites).
+  - It refuses if records were ingested after the last `resolve`.
+  - It refuses and writes nothing if no company is eligible, and explains why with counts (e.g.
+    USAspending-only records have no website until they join a SAM.gov record).
+  - It prints counts only: in thesis states, eligible, skipped by reason (no website, no NAICS,
+    NAICS outside the thesis, already labeled), cap, sampled per state.
+- **Live check (2026-09-27, example thesis):** USAspending alone gave 2,160 recipients in 6
+  states from 25 requests (45 s; rerun fully cached), none with a website, so the export
+  correctly refused. The SAM.gov extract is what makes candidates labelable.
+
 ### 11.1 Labels file
 
 `private/labels.csv` is written by the analyst. Expected columns (any different column names
@@ -685,10 +802,13 @@ conflicts, with details written to `private/evals/label_conflicts.csv`.
 
 Order of operations:
 
-1. The analyst creates `private/labels.csv`.
-2. The analyst runs `dealsource labels split` once. The defaults are the approved parameters:
+1. Discover and resolve candidates (`discover sam`, `discover usaspending`, `ingest csv`,
+   `resolve`).
+2. `dealsource labels export --thesis …` writes `private/to_label.csv` (§11.0).
+3. The analyst fills in `decision` and saves the file as `private/labels.csv`.
+4. The analyst runs `dealsource labels split` once. The defaults are the approved parameters:
    `--test-fraction 0.3 --seed 20260927`.
-3. Only then can the pipeline run.
+5. Only then can enrich, score, export and eval run.
 
 `labels split` behaviour:
 
@@ -697,8 +817,10 @@ Order of operations:
 - **Refuses if `private/labels_split.json` already exists**, i.e. a second run. There is no
   `--force`. Redoing a split means deleting the file by hand, which is deliberately
   inconvenient. The refusal prints the existing manifest's aggregate counts and creation time.
-- **Refuses if the DB already has any `runs` rows**, so pipeline output can't influence the
-  split. It records `db_had_runs: false` in the manifest.
+- **Refuses if a stage that could influence labels has already run** (`enrich`, `score`,
+  `export`, `run` or `eval` in the `runs` table), so pipeline inferences can't shape the
+  split. Discovery, ingest, resolve and the labeling export may have run; the manifest lists
+  them in `stages_before_split` and records `post_split_stages_had_run: false`.
 - **Stratified by decision, grouped by label key**: groups are first partitioned by decision
   (positive / negative). Within each stratum the sorted group keys are shuffled with
   `random.Random(seed)` (sorting first means file row order has no effect), and
@@ -717,7 +839,8 @@ Order of operations:
     "labels_sha256": "<hash of labels.csv at split time>",
     "grouped_by": "label_key",
     "labels_rows": 26,
-    "db_had_runs": false,
+    "post_split_stages_had_run": false,
+    "stages_before_split": ["discover_sam", "labels_export", "resolve"],
     "rule_for_new_keys": "sha256(f'{seed}:{key}') / 2**256 < test_fraction",
     "counts": {"dev": {"pursue": …, "pass": …}, "test": {"pursue": …, "pass": …}},
     "assignments": {"d:example.com": "dev", "n:acme tool|ga": "test", …},
@@ -729,15 +852,15 @@ Order of operations:
   overwritten), even if two runs race.
 - The command prints aggregate counts only: label rows → companies, then total, dev and test,
   each with pursue/pass counts. It never prints names, websites or keys. Refusals (second run,
-  missing file, conflicts, prior pipeline runs) exit with code 1.
+  missing file, conflicts, a post-split stage already run) exit with code 1.
 
 Implemented in `eval/labels.py` and `eval/split.py`. `labels status` isn't implemented yet.
 
-**Pipeline gating**: `ingest`, `resolve`, `enrich`, `score`, `run` and `eval` refuse to start
-(exit code 2) while `private/labels_split.json` is missing. That covers both the case where `labels.csv`
-hasn't been created yet and the case where it exists but hasn't been split. The error message
-gives the next step. The check applies to the configured data dir, so tests and demos with
-their own temporary data dir (and synthetic labels and split) aren't affected.
+**Pipeline gating**: `enrich`, `score`, `export`, `run` and `eval` refuse to start (exit code
+2) while `private/labels_split.json` is missing. The error message gives the next step.
+`discover`, `ingest`, `resolve`, `labels export`, `labels split` and `stats` run at any time.
+Nothing they show the analyst comes from enrichment or scoring. The check applies to the
+configured data dir, so tests and demos with their own temporary data dir aren't affected.
 
 **Labels added later**: existing assignments never change. A key that isn't in `assignments`
 is assigned deterministically by `sha256(f"{seed}:{key}") / 2**256 < test_fraction`, which is
@@ -826,7 +949,10 @@ The engine never collects personal contact information. It's enforced at several
 ## 13. CLI
 
 ```
-dealsource labels split [--test-fraction 0.3] [--seed N]   # once, before any pipeline run
+dealsource discover sam --thesis PATH [--month MM/YYYY] [--file ZIP] [--naics ..] [--state ..]
+dealsource discover usaspending --thesis PATH [--fiscal-years 5] [--naics ..] [--state ..]
+dealsource labels export --thesis PATH [--n 200] [--per-state-cap N] [--seed N]   # -> private/to_label.csv
+dealsource labels split [--test-fraction 0.3] [--seed N]   # once, before enrich/score/eval
 dealsource labels status                                   # aggregate counts only
 dealsource ingest csv PATH [--map ...] [--source-name NAME] [--revenue-unit usd_m]
 dealsource ingest cbp --naics 3323,3327 --geo state:13,37 --year 2022
@@ -919,3 +1045,7 @@ component (after v1).
 | 2026-09-27 | Different domains still never auto-merge, but same name + same location + different domains is flagged for review (`different_domains`) (§7.2). |
 | 2026-09-27 | `labels split` implemented: prints counts only (total, and pursue/pass for dev and test); rounds half up; the manifest also stores the decisions at split time (§11.3). |
 | 2026-09-27 | Phase 3 (enrich) implemented. LLM output is cleaned up and grounded against the page text after validation; unsupported numbers and quotes are dropped (§8.5). Fetching is sequential for now (§8.6). |
+| 2026-09-27 | Discovery from SAM.gov (public monthly extract, one request per month) and USAspending (contract recipients, last 5 fiscal years, no key); they join on UEI. OpenStreetMap, SBA search and state directories were not adopted (§6.3). |
+| 2026-09-27 | Discovery, ingest, resolve and `labels export` run before the split; enrich, score, export and eval stay gated. The split now refuses only if a stage that could influence labels has run (§11.3). |
+| 2026-09-27 | `labels export`: 200 companies with websites, thesis NAICS and states, spread across states with a per-state cap; the file has only company_name, website, state and an empty decision (§11.0). |
+| 2026-09-27 | Known limitation: candidates skew toward federal contractors (industrial) and under-represent consumer companies (§6.3). |

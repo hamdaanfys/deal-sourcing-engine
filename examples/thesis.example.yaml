@@ -1,0 +1,25 @@
+# Example thesis (fictional). Real theses live in private/theses/ and are never committed.
+name: "Example: Niche Industrial Manufacturing, Southeast US"
+sectors:
+  naics_prefixes: ["3323", "3327", "3329", "3339"]   # metal fabrication, machine shops, other fabricated metal, other machinery
+  include_keywords: ["precision machining", "fabrication", "industrial equipment"]
+  end_markets: ["aerospace", "medical devices", "food processing"]
+size:
+  employees: {min: 20, max: 250}
+  facilities: {min: 1, max: 8}
+  revenue_usd_m: {min: 5, max: 75}    # applied only when a CSV supplies revenue
+geography:
+  countries: ["US"]
+  states: ["GA", "FL", "NC", "SC", "TN", "AL"]
+ownership:
+  prefer: ["founder_led", "family_owned"]
+exclusions:
+  keywords: ["franchise", "staffing agency"]
+  ownership: ["pe_or_strategic_backed", "publicly_traded"]
+  domains: []
+weights:
+  sector: 0.40
+  size: 0.20
+  geography: 0.20
+  ownership: 0.20
+shortlist_threshold: 60

@@ -57,15 +57,24 @@ def count(assignments: dict[str, str], decisions: dict[str, str]) -> dict[str, d
     return counts
 
 
-def db_has_runs(db_path: Path) -> bool:
+# Stages whose output could influence labels (DESIGN.md §11.3). They may only run after the
+# split exists. Discovery, ingest, resolution and the labeling export show the analyst nothing
+# the pipeline inferred, so they are allowed before it.
+POST_SPLIT_STAGES = frozenset({"enrich", "score", "export", "run", "eval"})
+
+
+def stages_run(db_path: Path) -> set[str]:
+    """Stages recorded in the runs table (read-only; an absent DB means none)."""
     if not db_path.exists():
-        return False
+        return set()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
         ).fetchone()
-        return bool(exists and conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone())
+        if not exists:
+            return set()
+        return {r[0] for r in conn.execute("SELECT DISTINCT stage FROM runs")}
     finally:
         conn.close()
 
@@ -104,10 +113,13 @@ def make_split(
         raise SplitRefused(
             f"No labels file at {labels_path}. Create it first, then run this command."
         )
-    if db_has_runs(db_path):
+    prior = stages_run(db_path)
+    blocked = sorted(prior & POST_SPLIT_STAGES)
+    if blocked:
         raise SplitRefused(
-            "The database already has pipeline runs, so the split can no longer be made blind to "
-            "pipeline output. Start from an empty data dir (DESIGN.md §11.3)."
+            f"Pipeline stages that could influence labels have already run ({', '.join(blocked)}), "
+            "so the split can no longer be made blind to pipeline output. Start from a data dir "
+            "where only discovery/ingest/resolve/labels export have run (DESIGN.md §11.3)."
         )
 
     labels_bytes = labels_path.read_bytes()
@@ -131,7 +143,8 @@ def make_split(
         "grouped_by": "label_key",
         "labels_sha256": hashlib.sha256(labels_bytes).hexdigest(),
         "labels_rows": len(rows),
-        "db_had_runs": False,
+        "post_split_stages_had_run": False,
+        "stages_before_split": sorted(prior),
         "rule_for_new_keys": "sha256(f'{seed}:{key}') / 2**256 < test_fraction",
         "counts": counts,
         "assignments": dict(sorted(assignments.items())),

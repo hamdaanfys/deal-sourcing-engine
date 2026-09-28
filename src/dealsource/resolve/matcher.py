@@ -42,6 +42,7 @@ class MatchRecord:
     state: str | None
     city: str | None
     country: str | None
+    uei: str | None = None  # SAM.gov Unique Entity ID, shared by SAM and USAspending records
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ class PairDecision:
     @property
     def strength(self) -> float:
         # Domain matches outrank any name match; forced merges outrank everything.
-        bonus = {"override": 1000.0, "domain": 200.0}.get(self.method, 0.0)
+        bonus = {"override": 1000.0, "uei": 500.0, "domain": 200.0}.get(self.method, 0.0)
         return bonus + self.score
 
 
@@ -83,6 +84,9 @@ def location_relation(a: MatchRecord, b: MatchRecord) -> str:
 
 def compare(a: MatchRecord, b: MatchRecord) -> PairDecision:
     sim = name_similarity(a.key, b.key)
+    if a.uei and b.uei and a.uei == b.uei:
+        # The same federal registration: one legal entity, whatever the names or websites say.
+        return PairDecision(a.id, b.id, MERGE, "uei", sim, "same UEI")
     if a.domain and b.domain:
         if a.domain == b.domain:
             if sim < DOMAIN_NAME_MISMATCH:
@@ -119,6 +123,8 @@ def compare(a: MatchRecord, b: MatchRecord) -> PairDecision:
 def blocking_keys(r: MatchRecord) -> set[tuple[str, str]]:
     """Cheap keys that any true match is very likely to share, so we avoid comparing all pairs."""
     keys: set[tuple[str, str]] = set()
+    if r.uei:
+        keys.add(("uei", r.uei))
     if r.domain:
         keys.add(("domain", r.domain))
     tokens = r.key.split()
@@ -138,7 +144,7 @@ def candidate_pairs(records: list[MatchRecord]) -> tuple[set[tuple[int, int]], i
     pairs: set[tuple[int, int]] = set()
     skipped = 0
     for key, ids in blocks.items():
-        if len(ids) > MAX_BLOCK_SIZE and key[0] != "domain":
+        if len(ids) > MAX_BLOCK_SIZE and key[0] not in ("domain", "uei"):
             skipped += 1
             continue
         for a, b in combinations(sorted(ids), 2):
@@ -236,7 +242,7 @@ def cluster(
     rejected: list[tuple[PairDecision, str]] = []
     # Strongest evidence first, so when a constraint forces a cut, the weakest link is the one cut.
     for d in sorted(forced + merges, key=lambda d: (-d.strength, d.a, d.b)):
-        why = uf.union(d.a, d.b, ignore_domains=d.method == "override")
+        why = uf.union(d.a, d.b, ignore_domains=d.method in ("override", "uei"))
         if why is None:
             accepted.append(d)
         elif uf.find(d.a) != uf.find(d.b):

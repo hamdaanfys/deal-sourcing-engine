@@ -152,7 +152,8 @@ def test_manifest_contents_and_read_only(settings):
     path = settings.split_manifest_path
     m = json.loads(path.read_text())
     assert m["seed"] == 20260927 and m["test_fraction"] == 0.3
-    assert m["stratified_by"] == "decision" and m["db_had_runs"] is False
+    assert m["stratified_by"] == "decision" and m["post_split_stages_had_run"] is False
+    assert m["stages_before_split"] == []
     assert len(m["assignments"]) == len(m["decisions"]) == 24
     assert set(m["assignments"].values()) == {DEV, TEST}
     import hashlib
@@ -177,15 +178,28 @@ def test_refuses_without_labels_file_and_writes_nothing(settings):
     assert not settings.db_path.exists()
 
 
-def test_refuses_when_pipeline_has_already_run(settings):
+@pytest.mark.parametrize("stage", ["enrich", "score", "export", "run", "eval"])
+def test_refuses_when_a_label_influencing_stage_has_run(settings, stage):
     install_labels(settings)
     conn = db.connect(settings.db_path)
-    with db.record_run(conn, "resolve", {}):
+    with db.record_run(conn, stage, {}):
         pass
     conn.close()
-    with pytest.raises(SplitRefused, match="pipeline runs"):
+    with pytest.raises(SplitRefused, match=stage):
         split(settings)
     assert not settings.split_manifest_path.exists()
+
+
+def test_discovery_stages_before_the_split_are_allowed_and_recorded(settings):
+    install_labels(settings)
+    conn = db.connect(settings.db_path)
+    for stage in ("discover_sam", "resolve", "labels_export"):
+        with db.record_run(conn, stage, {}):
+            pass
+    conn.close()
+    split(settings)
+    m = json.loads(settings.split_manifest_path.read_text())
+    assert m["stages_before_split"] == ["discover_sam", "labels_export", "resolve"]
 
 
 def test_empty_database_does_not_block_the_split(settings):
@@ -265,9 +279,11 @@ def test_cli_conflicts_print_count_only(settings):
     assert "Zephyr" not in result.output
 
 
-def test_split_unlocks_the_pipeline(settings):
-    assert runner.invoke(cli.app, ["resolve"]).exit_code == 2
+def test_split_unlocks_enrichment(settings, monkeypatch):
+    monkeypatch.delenv("DEALSOURCE_USER_AGENT_CONTACT", raising=False)
+    assert runner.invoke(cli.app, ["enrich"]).exit_code == 2  # gated
     install_labels(settings)
     assert runner.invoke(cli.app, ["labels", "split"]).exit_code == 0
-    result = runner.invoke(cli.app, ["ingest", "csv", str(FIXTURES / "companies_messy.csv")])
-    assert result.exit_code == 0, result.output
+    result = runner.invoke(cli.app, ["enrich"])
+    assert result.exit_code == 1  # past the gate; now stops on the missing user-agent contact
+    assert "DEALSOURCE_USER_AGENT_CONTACT" in result.output

@@ -1,0 +1,6 @@
+{"category":"recipient","spending_level":"transactions","limit":100,"page_metadata":{"page":1,"next":2,"previous":null,"hasNext":true,"hasPrevious":false},
+ "results":[
+  {"amount":5164685.71,"recipient_id":"a1-C","name":"ACME PRECISION MACHINING LLC","code":null,"uei":"SAMGA0000001","total_outlays":null},
+  {"amount":2368093.0,"recipient_id":"b2-C","name":"GREENE MACHINE & MANUFACTURING INC","code":null,"uei":"USAGA0000011","total_outlays":null},
+  {"amount":1200.0,"recipient_id":"c3-R","name":"MULTIPLE RECIPIENTS","code":null,"uei":null,"total_outlays":null}
+ ],"messages":[]}

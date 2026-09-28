@@ -131,6 +131,15 @@ MIGRATIONS: list[str] = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 3: daily request counts for rate-limited APIs (SAM.gov allows 10 requests/day without a role)
+    """
+    CREATE TABLE api_usage (
+        api TEXT NOT NULL,
+        day TEXT NOT NULL,
+        requests INTEGER NOT NULL,
+        PRIMARY KEY (api, day)
+    );
+    """,
 ]
 
 

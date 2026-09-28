@@ -18,15 +18,58 @@ Firm-specific data lives in `private/` (gitignored). The repo ships only synthet
 
 ## Usage
 
-Pipeline commands refuse to run until the labels dev/test split exists
-(`private/labels_split.json`; see DESIGN.md §11.3).
+Discovery, resolution and the labeling export run before your labels exist. Enrichment,
+scoring and evaluation only run after the one-time labels split (`private/labels_split.json`;
+see DESIGN.md §11).
 
 ```sh
-dealsource ingest csv examples/companies.example.csv
-dealsource ingest cbp --naics 332710 --geo state:13,37 --year 2022
+# 1. Find candidates (real theses live in private/theses/, never committed)
+dealsource discover sam --thesis private/theses/my-thesis.yaml
+dealsource discover usaspending --thesis private/theses/my-thesis.yaml
+dealsource ingest csv private/inputs/licensed-list.csv   # optional: lists you're licensed to use
 dealsource resolve --review
+
+# 2. Label a sample (only company_name, website, state, decision; nothing the tool inferred)
+dealsource labels export --thesis private/theses/my-thesis.yaml     # -> private/to_label.csv
+#    fill in decision (pursue/pass), save as private/labels.csv, then, once:
+dealsource labels split
+
+# 3. After the split
+dealsource enrich
 dealsource stats
 ```
+
+## Getting a SAM.gov API key (free)
+
+`discover sam` downloads SAM.gov's public monthly entity extract with one request per month.
+
+1. Go to https://sam.gov and choose **Sign In**. Create a Login.gov account (email plus
+   two-factor authentication) if you don't have one; SAM.gov uses Login.gov for sign-in.
+2. Finish the SAM.gov profile it asks for. You don't need to register an entity or request a
+   role.
+3. Open **Workspace → Profile → Account Details**
+   (https://sam.gov/workspace/profile/account-details) and find the **Public API Key** field.
+4. Click the eye icon, enter the one-time password SAM.gov emails you, and submit. The key
+   appears.
+5. Put it in `.env` (gitignored): `SAM_API_KEY=...`. Never commit it or paste it anywhere else.
+6. Without a SAM.gov role the key allows **10 requests a day**. The tool uses one per monthly
+   file, keeps the file in `private/cache/sam/`, and refuses beyond
+   `SAM_DAILY_REQUEST_BUDGET` (default 8).
+7. If SAM.gov later rejects the key (HTTP 401/403), generate a new one on the same page.
+
+No key yet? Download the public monthly extract ZIP from SAM.gov's Data Services page yourself
+and run `dealsource discover sam --thesis ... --file path/to/SAM_PUBLIC_UTF-8_MONTHLY_V2_*.ZIP`.
+
+## Limitations
+
+- **Discovery skews toward federal contractors.** SAM.gov and USAspending only contain
+  companies registered to do business with the U.S. federal government. Candidates therefore
+  skew industrial, defense and government-supplier, and consumer-facing companies (food and
+  beverage brands, consumer products, retail-oriented manufacturers) are under-represented.
+  The labeling sample and every metric built on it inherit this skew. Add lists you're licensed
+  to use with `dealsource ingest csv` to widen coverage.
+- **The local 7B model is imperfect.** It invents numbers, which grounding against the page
+  text removes, and it marks ownership signals inconsistently (DESIGN.md §8.5–8.6).
 
 ## Tests
 

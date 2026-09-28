@@ -28,6 +28,8 @@ class Settings:
     allow_remote_llm: bool = False
     fetch_min_delay: float = 2.0
     fetch_max_pages: int = 5
+    sam_api_key: str | None = None
+    sam_daily_budget: int = 8
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -46,6 +48,8 @@ class Settings:
             allow_remote_llm=env.get("DEALSOURCE_ALLOW_REMOTE_LLM") == "1",
             fetch_min_delay=float(env.get("FETCH_MIN_DELAY_SECONDS") or 2.0),
             fetch_max_pages=int(env.get("FETCH_MAX_PAGES_PER_SITE") or 5),
+            sam_api_key=env.get("SAM_API_KEY") or None,
+            sam_daily_budget=int(env.get("SAM_DAILY_REQUEST_BUDGET") or 8),
         )
 
     @property
@@ -59,6 +63,14 @@ class Settings:
     @property
     def labels_path(self) -> Path:
         return self.data_dir / "labels.csv"
+
+    @property
+    def to_label_path(self) -> Path:
+        return self.data_dir / "to_label.csv"
+
+    @property
+    def sam_dir(self) -> Path:
+        return self.data_dir / "cache" / "sam"
 
     @property
     def overrides_path(self) -> Path:

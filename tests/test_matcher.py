@@ -283,3 +283,37 @@ def test_transitive_merge_via_shared_domain_and_name():
 def test_name_similarity_handles_spacing_and_empty():
     assert name_similarity("metal works", "metalworks") == 100.0
     assert name_similarity("", "acme") == 0.0
+
+
+# --- SAM.gov / USAspending identifiers ------------------------------------------------------
+
+
+def rec_uei(id_, name, uei, **kw):
+    r = rec(id_, name, **kw)
+    return MatchRecord(**{**r.__dict__, "uei": uei})
+
+
+def test_same_uei_merges_regardless_of_name_or_missing_location():
+    sam = rec_uei(
+        1,
+        "GREENE MACHINE & MANUFACTURING INC",
+        "LY4AHNDENQX6",
+        website="greenemachine.test",
+        state="GA",
+    )
+    usa = rec_uei(2, "Greene Machine and Mfg", "LY4AHNDENQX6")  # no website, no state
+    d = compare(sam, usa)
+    assert d.decision == MERGE and d.method == "uei"
+    assert same_company(cluster([sam, usa]), 1, 2)
+
+
+def test_different_ueis_fall_back_to_normal_rules():
+    a = rec_uei(1, "Acme Mfg. LLC", "AAAAAAAAAAAA", state="GA", city="Macon")
+    b = rec_uei(2, "ACME Manufacturing, Inc.", "BBBBBBBBBBBB", state="GA", city="Macon")
+    assert compare(a, b).method == "name_location"
+
+
+def test_uei_merge_is_not_blocked_by_a_domain_difference():
+    a = rec_uei(1, "Summit Controls", "CCCCCCCCCCCC", website="summitcontrols.test", state="TN")
+    b = rec_uei(2, "Summit Controls", "CCCCCCCCCCCC", website="summit-legacy.test", state="TN")
+    assert same_company(cluster([a, b]), 1, 2)

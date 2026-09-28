@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -21,6 +22,7 @@ from dealsource.enrich.fetcher import PoliteFetcher, is_cacheable_page
 from dealsource.enrich.pipeline import EnrichConfig
 from dealsource.enrich.pipeline import enrich as run_enrich
 from dealsource.enrich.prompts import PROMPT_VERSION
+from dealsource.eval.label_export import DEFAULT_N, ExportRefused, export_for_labeling
 from dealsource.eval.labels import LabelsError
 from dealsource.eval.split import (
     DEFAULT_SEED,
@@ -34,12 +36,24 @@ from dealsource.llm.cache import LLMRunner
 from dealsource.llm.ollama import OllamaBackend, RemoteHostRefused
 from dealsource.models import GeoSpec
 from dealsource.resolve.pipeline import resolve as run_resolve
+from dealsource.score.thesis import Thesis, ThesisError, load_thesis
 from dealsource.sources.census_cbp import CensusCBPSource, CensusError, store_stats
 from dealsource.sources.csv_source import ContactColumnError, CSVSource, store_records
+from dealsource.sources.sam_extract import (
+    SamError,
+    SamExtractSource,
+    download_extract,
+    latest_month,
+)
+from dealsource.sources.usaspending import UsaSpendingError, UsaSpendingSource
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 ingest_app = typer.Typer(no_args_is_help=True, help="Load companies or market data from a source.")
 app.add_typer(ingest_app, name="ingest")
+discover_app = typer.Typer(
+    no_args_is_help=True, help="Find candidate companies in public sources (SAM.gov, USAspending)."
+)
+app.add_typer(discover_app, name="discover")
 labels_app = typer.Typer(no_args_is_help=True, help="Analyst labels: the one-time dev/test split.")
 app.add_typer(labels_app, name="labels")
 
@@ -64,6 +78,31 @@ def make_clock():
     return SystemClock()
 
 
+def make_today() -> date:
+    return date.today()
+
+
+def get_thesis(path: Path) -> tuple[Thesis, str]:
+    try:
+        return load_thesis(path)
+    except ThesisError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def thesis_filters(
+    thesis: Thesis, naics: str | None, state: str | None
+) -> tuple[list[str], list[str]]:
+    prefixes = [c.strip() for c in naics.split(",")] if naics else thesis.sectors.naics_prefixes
+    states = [s.strip().upper() for s in state.split(",")] if state else thesis.geography.states
+    return prefixes, states
+
+
+def echo_per_state(per_state: dict[str, int]) -> None:
+    if per_state:
+        typer.echo("  per state: " + ", ".join(f"{k} {v}" for k, v in sorted(per_state.items())))
+
+
 def parse_age(value: str | None) -> float | None:
     """'30d', '12h' or '45m' -> seconds."""
     if not value:
@@ -83,16 +122,21 @@ def main(ctx: typer.Context) -> None:
 
 
 def require_split(settings: Settings) -> None:
-    """Pipeline commands only run once the labels dev/test split exists (DESIGN.md §11.3)."""
+    """Stages that could influence labels (enrich, score, export, eval) only run once the labels
+    dev/test split exists. Discovery, ingest, resolve and the labeling export may run before it
+    (DESIGN.md §11.3)."""
     if settings.split_manifest_path.exists():
         return
     if settings.labels_path.exists():
         step = "run `dealsource labels split` first"
     else:
-        step = f"create {settings.labels_path} and then run `dealsource labels split`"
+        step = (
+            "run `dealsource labels export`, fill in the decision column, save the file as "
+            f"{settings.labels_path}, then run `dealsource labels split`"
+        )
     typer.echo(
         f"Refusing to run: no labels split found at {settings.split_manifest_path}. "
-        f"The split must be made before any pipeline run; {step}.",
+        f"Enrichment, scoring and evaluation only run after the split; {step}.",
         err=True,
     )
     raise typer.Exit(2)
@@ -127,7 +171,6 @@ def ingest_csv(
 ) -> None:
     """Import companies from a CSV file. Contact-looking columns are dropped, never stored."""
     settings: Settings = ctx.obj
-    require_split(settings)
     try:
         source = CSVSource(
             path, source_name=source_name, column_map=parse_map(map_), revenue_unit=revenue_unit
@@ -169,7 +212,6 @@ def ingest_cbp(
 ) -> None:
     """Fetch Census County Business Patterns market data (report-only; never affects scores)."""
     settings: Settings = ctx.obj
-    require_split(settings)
     try:
         geos = [GeoSpec.parse(g) for g in geo]
     except ValueError as exc:
@@ -204,6 +246,147 @@ def ingest_cbp(
         )
 
 
+@discover_app.command("sam")
+def discover_sam(
+    ctx: typer.Context,
+    thesis_path: Annotated[
+        Path, typer.Option("--thesis", help="Thesis YAML (NAICS prefixes and states)")
+    ],
+    month: Annotated[
+        str | None, typer.Option(help="Extract month MM/YYYY (default: latest)")
+    ] = None,
+    file: Annotated[
+        Path | None, typer.Option(help="Use a public monthly extract ZIP you downloaded yourself")
+    ] = None,
+    naics: Annotated[str | None, typer.Option(help="Override the thesis NAICS prefixes")] = None,
+    state: Annotated[
+        str | None, typer.Option(help="Override the thesis states, e.g. GA,NC")
+    ] = None,
+) -> None:
+    """Candidates from the SAM.gov public monthly entity extract (one request per month)."""
+    settings: Settings = ctx.obj
+    thesis, thesis_hash = get_thesis(thesis_path)
+    prefixes, states = thesis_filters(thesis, naics, state)
+    conn = open_db(settings)
+    today = make_today()
+    params = {
+        "thesis_sha256": thesis_hash,
+        "naics": prefixes,
+        "states": states,
+        "month": month,
+        "file": bool(file),
+    }
+    with db.record_run(conn, "discover_sam", params) as stats:
+        try:
+            if file is not None:
+                zip_path, downloaded = file, False
+            else:
+                if not settings.sam_api_key:
+                    raise SamError(
+                        "Set SAM_API_KEY in .env (see README: 'Getting a SAM.gov API key'), "
+                        "or pass --file with a public extract you downloaded"
+                    )
+                if month:
+                    mm, _, yyyy = month.partition("/")
+                    year, mon = int(yyyy), int(mm)
+                else:
+                    year, mon = latest_month(today)
+                with make_http_client() as client:
+                    zip_path, downloaded = download_extract(
+                        conn,
+                        client,
+                        api_key=settings.sam_api_key,
+                        dest_dir=settings.sam_dir,
+                        year=year,
+                        month=mon,
+                        user_agent=user_agent(settings),
+                        today=today,
+                        daily_budget=settings.sam_daily_budget,
+                    )
+            source = SamExtractSource(zip_path, naics_prefixes=prefixes, states=states)
+            counts = store_records(conn, source.iter_records())
+        except (SamError, ValueError) as exc:
+            stats["error"] = str(exc)
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        st = source.stats
+        stats.update(
+            counts,
+            file=zip_path.name,
+            downloaded=downloaded,
+            scanned=st.scanned,
+            kept=st.kept,
+            with_website=st.with_website,
+        )
+    typer.echo(
+        f"SAM.gov extract {zip_path.name} ({'downloaded now' if downloaded else 'already on disk'})"
+    )
+    typer.echo(
+        f"Scanned {st.scanned:,} registrations: {st.kept:,} active in thesis NAICS/states "
+        f"({st.with_website:,} with a website); skipped {st.inactive:,} inactive, "
+        f"{st.not_public:,} not public, {st.excluded_entities:,} excluded, {st.dnb_era:,} D&B-era"
+    )
+    echo_per_state(st.per_state)
+    typer.echo(
+        f"Records: {counts['inserted']} new, {counts['updated']} updated, {counts['unchanged']} unchanged"
+    )
+
+
+@discover_app.command("usaspending")
+def discover_usaspending(
+    ctx: typer.Context,
+    thesis_path: Annotated[
+        Path, typer.Option("--thesis", help="Thesis YAML (NAICS prefixes and states)")
+    ],
+    fiscal_years: Annotated[int, typer.Option(help="How many recent federal fiscal years")] = 5,
+    naics: Annotated[str | None, typer.Option(help="Override the thesis NAICS prefixes")] = None,
+    state: Annotated[
+        str | None, typer.Option(help="Override the thesis states, e.g. GA,NC")
+    ] = None,
+) -> None:
+    """Candidates from USAspending.gov: federal contract recipients (no API key; no websites)."""
+    settings: Settings = ctx.obj
+    thesis, thesis_hash = get_thesis(thesis_path)
+    prefixes, states = thesis_filters(thesis, naics, state)
+    conn = open_db(settings)
+    params = {
+        "thesis_sha256": thesis_hash,
+        "naics": prefixes,
+        "states": states,
+        "fiscal_years": fiscal_years,
+    }
+    with make_http_client() as client, db.record_run(conn, "discover_usaspending", params) as stats:
+        http = CachedHttp(conn, client, user_agent(settings))
+        source = UsaSpendingSource(
+            http,
+            naics_prefixes=prefixes,
+            states=states,
+            today=make_today(),
+            fiscal_years=fiscal_years,
+            clock=make_clock(),
+        )
+        try:
+            counts = store_records(conn, source.iter_records())
+        except UsaSpendingError as exc:
+            stats["error"] = str(exc)
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        st = source.stats
+        stats.update(
+            counts, requests=st.requests, cache_hits=st.cache_hits, recipients=st.recipients
+        )
+    typer.echo(
+        f"USAspending contracts {source.start}..{source.end}: {st.recipients:,} recipients "
+        f"({st.requests} requests, {st.cache_hits} from cache)"
+    )
+    echo_per_state(st.per_state)
+    if st.truncated_states:
+        typer.echo(f"Warning: results truncated for {', '.join(st.truncated_states)} (page limit)")
+    typer.echo(
+        f"Records: {counts['inserted']} new, {counts['updated']} updated, {counts['unchanged']} unchanged"
+    )
+
+
 @app.command()
 def resolve(
     ctx: typer.Context,
@@ -213,7 +396,6 @@ def resolve(
 ) -> None:
     """Merge records that describe the same company (entity resolution)."""
     settings: Settings = ctx.obj
-    require_split(settings)
     conn = open_db(settings)
     review_path = settings.review_dir / "possible_matches.csv" if review else None
     with db.record_run(conn, "resolve", {"review": review}) as stats:
@@ -373,4 +555,72 @@ def labels_split(
     typer.echo(
         f"Labels split written to {result.manifest_path} (read-only; never redone). "
         f"{result.rows} label rows -> {result.companies} companies." + format_counts(result.counts)
+    )
+
+
+@labels_app.command("export")
+def labels_export(
+    ctx: typer.Context,
+    thesis_path: Annotated[
+        Path, typer.Option("--thesis", help="Thesis YAML (NAICS prefixes and states)")
+    ],
+    n: Annotated[int, typer.Option(help="How many companies to sample")] = DEFAULT_N,
+    per_state_cap: Annotated[
+        int | None, typer.Option(help="Max companies per state (default: 1.5x an even share)")
+    ] = None,
+    seed: Annotated[int, typer.Option(help="Random seed for the sample")] = DEFAULT_SEED,
+    out: Annotated[
+        Path | None, typer.Option(help="Output CSV (default: <data dir>/to_label.csv)")
+    ] = None,
+) -> None:
+    """Write a sample of candidates to label: company_name, website, state and an empty decision.
+
+    Nothing the pipeline infers is included, so labels aren't influenced by the tool. Prints
+    counts only."""
+    settings: Settings = ctx.obj
+    thesis, thesis_hash = get_thesis(thesis_path)
+    conn = open_db(settings)
+    raw_n = conn.execute("SELECT COUNT(*) FROM raw_records").fetchone()[0]
+    last_resolve = conn.execute(
+        "SELECT MAX(finished_at) FROM runs WHERE stage = 'resolve'"
+    ).fetchone()[0]
+    last_ingest = conn.execute("SELECT MAX(ingested_at) FROM raw_records").fetchone()[0]
+    if raw_n and (last_resolve is None or (last_ingest and last_ingest > last_resolve)):
+        typer.echo(
+            "Refusing to export: new records since the last `dealsource resolve`; run it first.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    out_path = out or settings.to_label_path
+    params = {"thesis_sha256": thesis_hash, "n": n, "per_state_cap": per_state_cap, "seed": seed}
+    with db.record_run(conn, "labels_export", params) as stats:
+        try:
+            result = export_for_labeling(
+                conn,
+                thesis,
+                out_path=out_path,
+                labels_path=settings.labels_path,
+                n=n,
+                per_state_cap=per_state_cap,
+                seed=seed,
+            )
+        except (ExportRefused, ValueError) as exc:
+            stats["error"] = str(exc)
+            typer.echo(f"Refusing to export: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        stats.update(eligible=result.eligible, sampled=result.sampled, per_state=result.per_state)
+    typer.echo(
+        f"Wrote {result.sampled} companies to {result.path} (columns: company_name, website, state, decision)"
+    )
+    typer.echo(
+        f"  {result.in_thesis_states:,} in thesis states -> {result.eligible:,} eligible; skipped "
+        f"{result.without_website:,} without a website, {result.naics_unknown:,} without NAICS, "
+        f"{result.naics_outside_thesis:,} outside thesis NAICS, {result.already_labeled:,} already labeled"
+    )
+    typer.echo(f"  per-state cap {result.per_state_cap}")
+    echo_per_state(result.per_state)
+    if result.sampled < n:
+        typer.echo(f"Note: only {result.sampled} of the requested {n} were available.")
+    typer.echo(
+        f"Next: fill in the decision column (pursue/pass), save as {settings.labels_path}, run `dealsource labels split`."
     )

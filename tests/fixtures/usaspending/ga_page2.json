@@ -1,0 +1,4 @@
+{"category":"recipient","spending_level":"transactions","limit":100,"page_metadata":{"page":2,"next":null,"previous":1,"hasNext":false,"hasPrevious":true},
+ "results":[
+  {"amount":98000.5,"recipient_id":"d4-C","name":"DALTON TOOL & DIE CO","code":null,"uei":"USAGA0000012","total_outlays":null}
+ ],"messages":[]}

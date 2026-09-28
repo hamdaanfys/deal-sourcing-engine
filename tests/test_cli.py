@@ -15,25 +15,25 @@ def invoke(*args):
     return runner.invoke(cli.app, list(args))
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        ["ingest", "csv", str(FIXTURES / "companies_messy.csv")],
-        ["resolve"],
-        ["ingest", "cbp", "--naics", "332700"],
-    ],
-)
-def test_pipeline_commands_refuse_without_labels_split(settings, command):
-    result = invoke(*command)
+def test_ingest_and_resolve_run_before_the_split(settings):
+    # Discovery-side stages create the companies the analyst labels, so they are allowed.
+    assert invoke("ingest", "csv", str(FIXTURES / "companies_messy.csv")).exit_code == 0
+    assert invoke("resolve").exit_code == 0
+    assert not settings.split_manifest_path.exists()
+
+
+def test_enrich_refuses_without_labels_split(settings, monkeypatch):
+    monkeypatch.setenv("DEALSOURCE_USER_AGENT_CONTACT", "https://example.org/contact")
+    result = invoke("enrich")
     assert result.exit_code == 2
-    assert "create" in result.output and "labels split" in result.output
+    assert "labels export" in result.output and "labels split" in result.output
     assert not settings.db_path.exists()
 
 
 def test_refusal_message_when_labels_exist_but_are_not_split(settings):
     settings.ensure_data_dir()
     settings.labels_path.write_text("company_name,decision\nSynthetic Co,1\n")
-    result = invoke("resolve")
+    result = invoke("enrich")
     assert result.exit_code == 2
     assert "run `dealsource labels split` first" in result.output
 

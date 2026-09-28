@@ -141,6 +141,44 @@ class CachedHttp:
                 )
         return CachedResponse(key, status, headers, body, False)
 
+    @staticmethod
+    def post_key(url: str, body: dict) -> str:
+        payload = json.dumps(body, sort_keys=True)
+        return f"{url}#post:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+    def post_json(self, url: str, body: dict, *, refresh: bool = False) -> CachedResponse:
+        """POST a JSON body, cached by URL + a hash of the body (for read-only search APIs)."""
+        payload = json.dumps(body, sort_keys=True)
+        key = self.post_key(url, body)
+        if not refresh:
+            hit = self.lookup(key)
+            if hit is not None:
+                return hit
+        resp = self.client.post(
+            url,
+            content=payload,
+            headers={"User-Agent": self.user_agent, "Content-Type": "application/json"},
+        )
+        headers = {k.lower(): v for k, v in resp.headers.items() if k.lower() in KEPT_HEADERS}
+        if self.cacheable(resp.status_code):
+            with self.conn:
+                self.conn.execute(
+                    """INSERT INTO http_cache (url, final_url, status, headers_json, body, content_hash, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(url) DO UPDATE SET status=excluded.status, headers_json=excluded.headers_json,
+                         body=excluded.body, content_hash=excluded.content_hash, fetched_at=excluded.fetched_at""",
+                    (
+                        key,
+                        url,
+                        resp.status_code,
+                        json.dumps(headers, sort_keys=True),
+                        zlib.compress(resp.content),
+                        hashlib.sha256(resp.content).hexdigest(),
+                        utcnow(),
+                    ),
+                )
+        return CachedResponse(key, resp.status_code, headers, resp.content, False)
+
     def get(
         self, url: str, params: dict[str, str] | None = None, *, refresh: bool = False
     ) -> CachedResponse:

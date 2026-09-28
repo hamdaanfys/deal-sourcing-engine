@@ -250,3 +250,45 @@ def site_server() -> SiteServer:
 @pytest.fixture
 def fake_llm() -> FakeLLMBackend:
     return FakeLLMBackend()
+
+
+# --- Discovery test doubles -------------------------------------------------------------
+
+import zipfile  # noqa: E402
+
+SAM_DAT = FIXTURES / "sam" / "SAM_PUBLIC_UTF-8_MONTHLY_V2_20260906.dat"
+EXAMPLE_THESIS = Path(__file__).parent.parent / "examples" / "thesis.example.yaml"
+
+
+@pytest.fixture
+def sam_zip(tmp_path) -> Path:
+    path = tmp_path / "SAM_PUBLIC_UTF-8_MONTHLY_V2_20260906.ZIP"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(SAM_DAT, SAM_DAT.name)
+    return path
+
+
+class UsaSpendingServer:
+    """Serves saved recipient pages keyed by (state, page); logs request bodies."""
+
+    PAGES = {("GA", 1): "ga_page1.json", ("GA", 2): "ga_page2.json", ("NC", 1): "nc_page1.json"}
+
+    def __init__(self):
+        self.bodies: list[dict] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        state = body["filters"]["recipient_locations"][0]["state"]
+        name = self.PAGES.get((state, body["page"]))
+        if name is None:
+            return httpx.Response(200, json={"results": [], "page_metadata": {"hasNext": False}})
+        return httpx.Response(200, content=(FIXTURES / "usaspending" / name).read_bytes())
+
+    def client(self) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(self.handler))
+
+
+@pytest.fixture
+def usa_server() -> UsaSpendingServer:
+    return UsaSpendingServer()

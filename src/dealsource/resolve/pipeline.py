@@ -50,6 +50,7 @@ def load_records(conn: sqlite3.Connection) -> list[LoadedRecord]:
                     state=normalize_state(p.get("state")),
                     city=normalize_city(p.get("city")),
                     country=normalize_country(p.get("country")),
+                    uei=((p.get("extra") or {}).get("uei") or None),
                 ),
                 source=row["source"],
                 payload=p,
