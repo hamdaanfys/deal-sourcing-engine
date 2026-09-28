@@ -823,6 +823,40 @@ def websites_find(
     )
 
 
+@websites_app.command("recheck")
+def websites_recheck(ctx: typer.Context) -> None:
+    """Re-verify found and ambiguous websites with the current rules, from the cache only.
+
+    No network requests. Websites that no longer pass lose their record; run `resolve` next."""
+    settings: Settings = ctx.obj
+    conn = open_db(settings)
+    with db.record_run(conn, "websites_recheck", {}) as stats:
+        result = website_finder.recheck(conn)
+        stats.update(vars(result))
+    down = sum(result.downgraded.values())
+    typer.echo(f"Rechecked {result.rechecked:,} results offline")
+    typer.echo(
+        f"  found, no longer accepted: {down:,}"
+        + (
+            " (" + ", ".join(f"now {k} {v:,}" for k, v in sorted(result.downgraded.items())) + ")"
+            if down
+            else ""
+        )
+    )
+    typer.echo(
+        f"  found, different domain: {result.domain_changed:,}; "
+        f"confidence changed: {result.confidence_changed:,}; unchanged: {result.unchanged:,}"
+    )
+    typer.echo(
+        f"  ambiguous, now found: {result.upgraded:,}; still ambiguous: {result.still_ambiguous:,}"
+    )
+    if result.not_replayable:
+        typer.echo(
+            f"  not replayable from the cache (left as they were): {result.not_replayable:,}"
+        )
+    typer.echo("Next: `dealsource resolve` so companies pick up the changes.")
+
+
 @websites_app.command("sample")
 def websites_sample(
     ctx: typer.Context,
@@ -831,17 +865,27 @@ def websites_sample(
     out: Annotated[
         Path | None, typer.Option(help="Output CSV (default: <data dir>/review/website_sample.csv)")
     ] = None,
+    exclude: Annotated[
+        list[Path] | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="An earlier sample CSV whose companies to leave out (repeatable)",
+        ),
+    ] = None,
 ) -> None:
     """Write a random sample of found websites to a private CSV for hand-checking (counts only here)."""
     settings: Settings = ctx.obj
     conn = open_db(settings)
     out_path = out or settings.review_dir / "website_sample.csv"
     try:
-        result = write_sample(conn, out_path, n=n, seed=seed)
+        result = write_sample(conn, out_path, n=n, seed=seed, exclude=exclude)
     except SampleRefused as exc:
         typer.echo(f"Refusing: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"Wrote {result.sampled} of {result.found:,} found websites to {result.path}")
+    if exclude:
+        typer.echo(f"  left out {result.excluded} found websites that were in earlier samples")
     typer.echo(
         "  by confidence: " + ", ".join(f"{k}: {v}" for k, v in result.by_confidence.items())
     )

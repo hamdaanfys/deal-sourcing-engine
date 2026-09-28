@@ -25,11 +25,13 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
+import httpx
 from selectolax.parser import HTMLParser
 
 from dealsource.db import utcnow
 from dealsource.enrich import fetcher as f
 from dealsource.enrich.extract import extract_text
+from dealsource.httpcache import CachedHttp
 from dealsource.privacy import scrub_contact_info
 from dealsource.resolve.matcher import name_similarity
 from dealsource.resolve.normalize import (
@@ -39,6 +41,7 @@ from dealsource.resolve.normalize import (
     name_key,
     name_tokens,
     normalize_city,
+    word_keys,
 )
 from dealsource.score.thesis import Thesis
 
@@ -77,13 +80,17 @@ MAX_CANDIDATES = 4
 DEFAULT_SEED = 20260928
 
 # Confidence for each accepted combination of name evidence and location evidence.
+# "title" is an exact normalized name in the title or og:site_name; "title_fuzzy" is a close
+# but different one, which could be another company, so it also needs the city.
 CONFIDENCE = {
     ("title", "city"): 0.95,
     ("title", "state"): 0.90,
+    ("title_fuzzy", "city"): 0.85,
     ("body", "city"): 0.85,
     ("body", "state"): 0.75,
 }
 TITLE_MATCH = 93.0
+EXACT_TITLE = 100.0
 
 FOUND, NOT_FOUND, TOO_GENERIC, AMBIGUOUS, ERROR = (
     "found",
@@ -156,7 +163,9 @@ def _snippet(text: str, start: int, end: int) -> str:
 
 
 def verify_page(html: str, target: Target) -> tuple[float, dict]:
-    """(confidence, evidence) if the page shows the company's name AND city/state; else (0, why)."""
+    """(confidence, evidence) if the page shows the company's name AND city/state; else (0, why).
+
+    A title that is close to the name but not the same needs the city; the state isn't enough."""
     title, desc, text = extract_text(html, keep_footer=True)
     page = f"{title}\n{desc}\n{text}"
     low = page.lower()
@@ -168,12 +177,19 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
         (name_similarity(key, name_key(n)) for n in _site_names(html, title)), default=0.0
     )
     distinct = [t for t in key.split() if t not in GENERIC_WORDS and len(t) >= 3]
+    # Whole words only, plurals included: "tools" counts for "tool", "precision" not for "precise".
     body_hit = (
         bool(distinct)
         and (len(distinct) >= 2 or len(distinct[0]) >= 6)
-        and all(re.search(rf"\b{re.escape(t)}", low) for t in distinct)
+        and set(distinct) <= word_keys(page)
     )
-    name_match = "title" if title_score >= TITLE_MATCH else "body" if body_hit else None
+    # A close-but-not-exact title may name a different company, so body words can't overrule it.
+    if title_score >= EXACT_TITLE:
+        name_match = "title"
+    elif title_score >= TITLE_MATCH:
+        name_match = "title_fuzzy"
+    else:
+        name_match = "body" if body_hit else None
 
     loc_match, loc_span = None, None
     city = normalize_city(target.city) if target.city else None
@@ -205,6 +221,9 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
     }
     if not name_match or not loc_match:
         evidence["rejected"] = "no name evidence" if not name_match else "no city/state evidence"
+        return 0.0, evidence
+    if (name_match, loc_match) not in CONFIDENCE:
+        evidence["rejected"] = "fuzzy title needs city"
         return 0.0, evidence
     return CONFIDENCE[(name_match, loc_match)], evidence
 
@@ -444,6 +463,103 @@ def _save(conn, t: Target, status, dom, conf, evidence, log) -> None:
                      payload_hash=excluded.payload_hash, ingested_at=excluded.ingested_at""",
                 (t.search_key, body, hashlib.sha256(body.encode()).hexdigest(), utcnow()),
             )
+        else:  # a recheck can take a website away; the next `resolve` drops it from the company
+            conn.execute(
+                "DELETE FROM raw_records WHERE source = 'websites' AND source_record_id = ?",
+                (t.search_key,),
+            )
+
+
+class _OfflineHttp(CachedHttp):
+    """Replays the cache: every cached answer counts as fresh and nothing goes to the network."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        super().__init__(conn, None, "dealsource-recheck (offline)")  # type: ignore[arg-type]
+
+    def lookup(self, url, params=None, *, max_age_seconds=None):
+        return super().lookup(url, params)
+
+    def fetch(self, url, params=None, **kwargs):
+        raise httpx.ConnectError(f"not cached (offline recheck): {url}")
+
+
+@dataclass
+class RecheckStats:
+    rechecked: int = 0
+    unchanged: int = 0
+    confidence_changed: int = 0
+    domain_changed: int = 0
+    downgraded: dict[str, int] = field(default_factory=dict)  # found -> new status
+    upgraded: int = 0  # ambiguous -> found
+    still_ambiguous: int = 0
+    not_replayable: int = 0  # a page or redirect missing from the cache; row left as it was
+
+
+def _recheck_targets(conn: sqlite3.Connection) -> Iterator[tuple[sqlite3.Row, Target]]:
+    """Found and ambiguous rows with the company details the finder used for them."""
+    rows = conn.execute(
+        """SELECT w.search_key, w.company_id, w.status, w.domain, w.confidence, w.candidates_json,
+                  r.payload_json, c.canonical_name, c.city, c.state
+           FROM website_search w
+           LEFT JOIN raw_records r ON r.source = 'websites' AND r.source_record_id = w.search_key
+           LEFT JOIN companies c ON c.id = w.company_id
+           WHERE w.status IN ('found', 'ambiguous') ORDER BY w.search_key"""
+    ).fetchall()
+    for row in rows:
+        if row["payload_json"]:
+            p = json.loads(row["payload_json"])
+            name, city, state, uei = p["name"], p["city"], p["state"], p["extra"].get("uei")
+        elif row["canonical_name"] and row["state"]:
+            name, city, state = row["canonical_name"], row["city"], row["state"]
+            uei = row["search_key"][4:] if row["search_key"].startswith("uei:") else None
+        else:
+            continue
+        yield row, Target(row["company_id"], row["search_key"], name, city, state, uei)
+
+
+def recheck(conn: sqlite3.Connection) -> RecheckStats:
+    """Re-verify every found or ambiguous result with the current rules, from the cache only.
+
+    DNS answers come from the saved per-candidate log and pages and redirects from the HTTP
+    cache, so no request is made. A row whose replay needs something that isn't cached is
+    left as it was and counted as not replayable. Results are saved like a normal run; a
+    website that no longer passes loses its `websites` record (run `resolve` afterwards)."""
+    fetcher = f.PoliteFetcher(_OfflineHttp(conn), clock=_NoWaitClock(), min_delay=0.0)
+    stats = RecheckStats()
+    for row, t in list(_recheck_targets(conn)):
+        old_log = json.loads(row["candidates_json"] or "[]")
+        dns = {e["domain"]: e.get("dns", False) for e in old_log}
+        status, dom, conf, evidence, log = _check(t, fetcher, lambda d, dns=dns: dns.get(d, False))
+        replayed = {e["domain"]: e.get("fetch") for e in log}
+        if any(replayed.get(e["domain"]) != e.get("fetch") for e in old_log):
+            stats.not_replayable += 1
+            continue
+        stats.rechecked += 1
+        if row["status"] == FOUND:
+            if status != FOUND:
+                stats.downgraded[status] = stats.downgraded.get(status, 0) + 1
+            elif dom != row["domain"]:
+                stats.domain_changed += 1
+            elif conf != row["confidence"]:
+                stats.confidence_changed += 1
+            else:
+                stats.unchanged += 1
+        elif status == FOUND:
+            stats.upgraded += 1
+        elif status == AMBIGUOUS:
+            stats.still_ambiguous += 1
+        _save(conn, t, status, dom, conf, evidence, log)
+    return stats
+
+
+class _NoWaitClock:
+    """The offline recheck makes no requests, so there is nothing to space out."""
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    def sleep(self, seconds: float) -> None:
+        pass
 
 
 def found_rows(conn: sqlite3.Connection) -> Iterator[sqlite3.Row]:

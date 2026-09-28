@@ -111,6 +111,57 @@ def test_lowercase_state_code_is_not_evidence():
     assert wf.verify_page(html, target(city=None))[0] == 0.0
 
 
+# A different company whose name is close to Acme Precision Machining's.
+FUZZY_TITLE = """<html><head><title>Acma Precision Machining | Home</title></head>
+<body><p>Acma Precision Machining: parts since 1971.</p>
+<footer>Warner Robins, GA 31088</footer></body></html>"""
+
+
+def test_close_but_different_title_with_only_the_state_is_rejected():
+    conf, ev = wf.verify_page(FUZZY_TITLE, target())
+    assert wf.TITLE_MATCH <= ev["name_score"] < wf.EXACT_TITLE
+    assert ev["name_match"] == "title_fuzzy" and ev["location_match"] == "state"
+    assert conf == 0.0 and ev["rejected"] == "fuzzy title needs city"
+    # No city on record: a close title can never be enough.
+    assert wf.verify_page(FUZZY_TITLE, target(city=None))[0] == 0.0
+
+
+def test_close_title_with_the_city_is_accepted_at_lower_confidence():
+    conf, ev = wf.verify_page(FUZZY_TITLE, target(city="Warner Robins"))
+    assert (conf, ev["name_match"], ev["location_match"]) == (0.85, "title_fuzzy", "city")
+
+
+def test_body_words_do_not_rescue_a_close_but_different_title():
+    html = FUZZY_TITLE.replace("parts since", "Acme precision machining since")
+    conf, ev = wf.verify_page(html, target())
+    assert ev["name_match"] == "title_fuzzy" and conf == 0.0
+
+
+def test_exact_normalized_title_accepts_suffix_plural_and_abbreviation_changes():
+    html = GOOD.replace("Acme Precision Machining |", "ACME Precision Machinings, Inc. |")
+    conf, ev = wf.verify_page(html, target())
+    assert (conf, ev["name_match"], ev["name_score"]) == (0.95, "title", 100.0)
+
+
+def body_page(words):
+    return f"<html><head><title>Home</title></head><body><p>{words}</p><footer>Macon, GA</footer></body></html>"
+
+
+@pytest.mark.parametrize(
+    ("words", "accepted"),
+    [
+        ("Kraft Mold since 1980", True),
+        ("Kraft Molds since 1980", True),  # plural of the same word
+        ("Kraftwerk Molding since 1980", False),  # the words only as prefixes
+        ("Hovercraft Moldy since 1980", False),
+    ],
+)
+def test_body_name_words_must_be_whole_words_but_plurals_count(words, accepted):
+    conf, ev = wf.verify_page(body_page(words), target(name="KRAFT MOLD LLC"))
+    assert (conf > 0) is accepted
+    assert ev["name_match"] == ("body" if accepted else None)
+
+
 # --- per-company checks ----------------------------------------------------------------------
 
 
@@ -336,6 +387,120 @@ def test_sample_file_and_refusals(conn, tmp_path, site_server, clock):
     assert rows[0]["confidence"] == "0.95"
     with pytest.raises(SampleRefused, match="never overwritten"):
         write_sample(conn, tmp_path / "s.csv")
+
+
+def test_sample_leaves_out_companies_from_earlier_samples(conn, tmp_path, site_server, clock):
+    seed_companies(conn)
+    site_server.add("acmeprecisionmachining.com", "/", body=GOOD)
+    site_server.add(
+        "greenemachinemanufacturing.com",
+        "/",
+        body=GOOD.replace("Acme Precision Machining", "Greene Machine & Manufacturing"),
+    )
+    greene = target(name="GREENE MACHINE & MANUFACTURING INC", uei="USAGA0000011", cid=2)
+    wf.run_finder(
+        conn,
+        [target(), greene],
+        fetcher=fetcher_for(conn, site_server, clock),
+        resolver=resolver_for("acmeprecisionmachining.com", "greenemachinemanufacturing.com"),
+    )
+    first = write_sample(conn, tmp_path / "first.csv", n=1, seed=1)
+    second = write_sample(conn, tmp_path / "second.csv", n=30, exclude=[tmp_path / "first.csv"])
+    assert (second.found, second.excluded, second.sampled) == (2, 1, 1)
+    old = {r["website"] for r in csv.DictReader((tmp_path / "first.csv").open())}
+    new = {r["website"] for r in csv.DictReader((tmp_path / "second.csv").open())}
+    assert first.sampled == 1 and not old & new
+
+
+# --- recheck with current rules ----------------------------------------------------------
+
+
+def test_recheck_downgrades_old_accepts_offline_and_resolve_drops_them(
+    conn, site_server, clock, monkeypatch
+):
+    seed_companies(conn)
+    site_server.add("acmeprecisionmachining.com", "/", body=FUZZY_TITLE)
+    site_server.add(
+        "greenemachinemanufacturing.com",
+        "/",
+        status=301,
+        headers={"location": "https://greene-mfg.com/"},
+    )
+    site_server.add(
+        "greene-mfg.com",
+        "/",
+        body=GOOD.replace("Acme Precision Machining", "Greene Machine & Manufacturing"),
+    )
+    greene = target(name="GREENE MACHINE & MANUFACTURING INC", uei="USAGA0000011", cid=2)
+    resolver = resolver_for(
+        "acmeprecisionmachining.com", "greenemachinemanufacturing.com", "greene-mfg.com"
+    )
+    # Find both under the old rule, where a close title plus the state was enough.
+    with monkeypatch.context() as m:
+        m.setitem(wf.CONFIDENCE, ("title_fuzzy", "state"), 0.90)
+        stats = wf.run_finder(
+            conn,
+            [target(), greene],
+            fetcher=fetcher_for(conn, site_server, clock),
+            resolver=resolver,
+        )
+    assert stats.statuses == {"found": 2}
+    resolve(conn, source_priority=("usaspending", "websites"))
+    assert (
+        conn.execute("SELECT COUNT(*) FROM companies WHERE domain IS NOT NULL").fetchone()[0] == 2
+    )
+
+    requests_before = len(site_server.requests)
+    result = wf.recheck(conn)
+    assert len(site_server.requests) == requests_before  # cache only, redirects included
+    assert result.rechecked == 2 and result.not_replayable == 0
+    assert result.downgraded == {"not_found": 1} and result.unchanged == 1
+    row = conn.execute(
+        "SELECT status, domain, evidence_json FROM website_search WHERE search_key = 'uei:SAMGA0000001'"
+    ).fetchone()
+    assert (row["status"], row["domain"], row["evidence_json"]) == ("not_found", None, None)
+
+    resolve(conn, source_priority=("usaspending", "websites"))
+    domains = dict(conn.execute("SELECT canonical_name, domain FROM companies").fetchall())
+    assert domains["ACME PRECISION MACHINING LLC"] is None
+    assert domains["GREENE MACHINE & MANUFACTURING INC"] == "greene-mfg.com"
+
+
+def test_recheck_turns_ambiguous_into_found_when_one_site_no_longer_passes(
+    conn, site_server, clock, monkeypatch
+):
+    seed_companies(conn)
+    site_server.add("acmeprecisionmachining.com", "/", body=GOOD)
+    site_server.add("acmeprecision.com", "/", body=FUZZY_TITLE)
+    resolver = resolver_for("acmeprecisionmachining.com", "acmeprecision.com")
+    with monkeypatch.context() as m:
+        m.setitem(wf.CONFIDENCE, ("title_fuzzy", "state"), 0.90)
+        wf.run_finder(
+            conn, [target()], fetcher=fetcher_for(conn, site_server, clock), resolver=resolver
+        )
+    assert conn.execute("SELECT status FROM website_search").fetchone()[0] == "ambiguous"
+    result = wf.recheck(conn)
+    assert result.upgraded == 1
+    assert tuple(conn.execute("SELECT status, domain FROM website_search").fetchone()) == (
+        "found",
+        "acmeprecisionmachining.com",
+    )
+
+
+def test_recheck_leaves_rows_it_cannot_replay_from_the_cache(conn, site_server, clock):
+    seed_companies(conn)
+    site_server.add("acmeprecisionmachining.com", "/", body=GOOD)
+    wf.run_finder(
+        conn,
+        [target()],
+        fetcher=fetcher_for(conn, site_server, clock),
+        resolver=resolver_for("acmeprecisionmachining.com"),
+    )
+    with conn:
+        conn.execute("DELETE FROM http_cache WHERE url LIKE '%acmeprecisionmachining.com/'")
+    result = wf.recheck(conn)
+    assert (result.not_replayable, result.rechecked) == (1, 0)
+    assert conn.execute("SELECT status FROM website_search").fetchone()[0] == "found"
 
 
 # --- CLI ----------------------------------------------------------------------------------
@@ -566,3 +731,22 @@ def test_worker_errors_are_recorded_like_sequential_ones(conn, settings, monkeyp
     monkeypatch.setattr(wf, "check_company", boom)
     stats = wf.run_finder(conn, targets, fetchers=[None, None, None], resolver=resolver_for())
     assert stats.statuses == {"error": 6} and stats.checked == 6
+
+
+def test_cli_recheck_prints_counts_only(settings, site_server, clock, monkeypatch):
+    site_server.add("acmeprecisionmachining.com", "/", body=GOOD)
+    conn = db.connect(settings.db_path)
+    seed_companies(conn)
+    wf.run_finder(
+        conn,
+        [target()],
+        fetcher=fetcher_for(conn, site_server, clock),
+        resolver=resolver_for("acmeprecisionmachining.com"),
+    )
+    conn.close()
+    monkeypatch.setattr(cli, "make_http_client", lambda: pytest.fail("recheck must not fetch"))
+    result = runner.invoke(cli.app, ["websites", "recheck"])
+    assert result.exit_code == 0, result.output
+    assert "Rechecked 1 results offline" in result.output
+    assert "found, no longer accepted: 0" in result.output
+    assert "acme" not in result.output.lower()

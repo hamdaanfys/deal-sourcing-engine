@@ -353,9 +353,16 @@ third-party data source, fetching only the companies' own homepages
    - A redirect to a platform (Facebook, Wix, …) counts as no website.
 3. **Strict verification.** Both are required, from text that includes the footer (where
    addresses usually are):
-   - **Name:** a title or `og:site_name` segment scores ≥ 93 against the company name, or
-     every distinctive word of the name appears on the page (at least two words, or one of
-     6+ letters).
+   - **Name**, strongest first:
+     - *exact title*: a title or `og:site_name` segment has the same normalized name
+       (`name_key`: legal suffixes dropped, abbreviations expanded, plurals singularized).
+     - *fuzzy title*: a segment scores 93–99 against the name. A close but different name
+       may be another company, so it is accepted **only with the city**; the state is not
+       enough, and with no city on record it is never enough. Body words can't overrule a
+       fuzzy title.
+     - *body*: every distinctive word of the name appears on the page as a whole word
+       (plurals count: "Tools" for "tool"; prefixes don't: "Kraftwerk" isn't "kraft"), with
+       at least two words, or one of 6+ letters.
    - **Location:** the company's city (when known), or its state as `, GA`, `GA 31201` or the
      full state name. Upper-case codes only, so "ga ga" doesn't count.
 
@@ -364,8 +371,10 @@ third-party data source, fetching only the companies' own homepages
 
    | Name evidence | Location evidence | Confidence |
    |---|---|---|
-   | title | city | 0.95 |
-   | title | state | 0.90 |
+   | title (exact) | city | 0.95 |
+   | title (exact) | state | 0.90 |
+   | title_fuzzy | city | 0.85 |
+   | title_fuzzy | state | rejected |
    | body | city | 0.85 |
    | body | state | 0.75 |
 
@@ -398,6 +407,14 @@ third-party data source, fetching only the companies' own homepages
 8. **Hand-check before labeling:** `dealsource websites sample [--n 30]` writes a random
    sample of found websites to `private/review/website_sample.csv` (name, city, state,
    website, confidence, evidence, and an empty `correct` column). It prints counts only.
+   `--exclude <earlier sample.csv>` (repeatable) leaves out companies already hand-checked,
+   so a sample drawn after a rule change isn't measured on the companies that prompted it.
+9. **Recheck after a rule change:** `dealsource websites recheck` re-verifies every `found`
+   and `ambiguous` result with the current rules **from the cache only** (DNS answers from
+   the saved candidate log, pages and redirects from the HTTP cache; no requests). A website
+   that no longer passes loses its `websites` raw record, an `ambiguous` result becomes
+   `found` if only one domain still passes, and a result whose replay needs something that
+   isn't cached is left as it was and counted. It prints counts only; run `resolve` next.
 
 **Measured:**
 - **2026-09-27 experiment** (25 Georgia recipients): 28% verified with name-or-title matching
@@ -733,7 +750,13 @@ LLM calls.
   §8.1 isn't implemented for `enrich` yet (the website finder has parallel workers built on
   the same fetcher, §6.4); with a 2 s minimum delay (10 s for sites that ask), fetching takes
   2–60 s per company.
-- **Contact scrubbing**: emails and phone numbers only. Street addresses aren't scrubbed
+- **Contact scrubbing**: emails and phone numbers only, including numbers spelled with
+  capital letters ("1-800-FLOWERS", "(478) 555-FIXX", "555-FIXX"). Those need `-`/`.`
+  separators (a space only after "(478)") and at least one letter, so all-caps prose ("100
+  PERCENT") and specs ("MIL-STD-810G", "ISO 9001") survive; a 3-digit-dash-4-caps code such
+  as "100-PACK" is scrubbed too, which is accepted. Lower-case vanity numbers and bare
+  7-digit numbers without an area code ("555-1234", which clashes with ranges like
+  "250-1000") are not matched. Street addresses aren't scrubbed
   (company addresses aren't personal data, and contact pages are never fetched).
 - **LLM interface**: `LLMBackend.check()` plus `chat(messages, schema, options)`, rather than
   `generate_structured(system, user, …)`, so the invalid-JSON retry can send the bad reply back

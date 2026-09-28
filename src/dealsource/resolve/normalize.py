@@ -205,6 +205,12 @@ def name_tokens(name: str) -> list[str]:
 
 
 @lru_cache(maxsize=100_000)
+def word_keys(text: str) -> set[str]:
+    """The words of ``text`` as name_key spells them (abbreviations expanded, plurals
+    singularized), for whole-word lookups: 'Tools' gives 'tool', 'Precision' never gives 'precise'."""
+    return {_singular(ABBREVIATIONS.get(t, t)) for t in name_tokens(text)}
+
+
 def name_key(name: str) -> str:
     """Matching key: folded, lowercased, abbreviations expanded, legal suffixes and a leading
     'the' removed, plurals singularized. 'Acme Mfg. LLC' and 'ACME Manufacturing, Inc.' both
