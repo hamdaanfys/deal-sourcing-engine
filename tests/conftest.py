@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import httpx
@@ -83,18 +84,22 @@ OLLAMA = FIXTURES / "ollama"
 
 
 class FakeClock:
-    """Monotonic time that only moves when something sleeps (or a test advances it)."""
+    """Monotonic time that only moves when something sleeps (or a test advances it).
+
+    Thread-safe, and shared by all threads: a sleep in one thread moves time for all."""
 
     def __init__(self, start: float = 1000.0):
         self.now = start
         self.sleeps: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self.now += max(0.0, seconds)
+        with self._lock:
+            self.sleeps.append(seconds)
+            self.now += max(0.0, seconds)
 
     def advance(self, seconds: float) -> None:
         self.now += seconds

@@ -6,16 +6,23 @@ only if the page shows BOTH the company's name AND its city or state. Anything u
 without location, location without name, two different verified domains, parked pages,
 redirects to unverifiable sites) gets no website. Each company's result is saved as soon as it
 is done, so an interrupted run resumes where it stopped.
+
+Companies can be checked by several worker threads, each with its own fetcher; the fetchers
+share one SiteGate, so per-site politeness is the same as a sequential run.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import queue
+import random
 import re
 import socket
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 from selectolax.parser import HTMLParser
@@ -67,6 +74,7 @@ PARKED_PHRASES = (
     "sedo domain",
 )
 MAX_CANDIDATES = 4
+DEFAULT_SEED = 20260928
 
 # Confidence for each accepted combination of name evidence and location evidence.
 CONFIDENCE = {
@@ -209,7 +217,29 @@ class FinderStats:
     statuses: dict[str, int] = field(default_factory=dict)
 
 
-def targets(conn: sqlite3.Connection, thesis: Thesis | None) -> list[Target]:
+def sample_order(targets_list: Iterable[Target], seed: int = DEFAULT_SEED) -> list[Target]:
+    """Seeded random order, spread across states in proportion to their size.
+
+    Each state's companies are shuffled (seeded per state, so adding a state leaves the others'
+    order alone) and placed at evenly spaced positions (rank + random offset) / state size.
+    Any prefix of the result holds each state's share, within about one company.
+    """
+    by_state: dict[str, list[Target]] = defaultdict(list)
+    for t in sorted(targets_list, key=lambda t: t.search_key):
+        by_state[t.state].append(t)
+    keyed: list[tuple[float, str, Target]] = []
+    for state, group in by_state.items():
+        rng = random.Random(f"{seed}:{state}")
+        rng.shuffle(group)
+        offset = rng.random()
+        keyed += [((i + offset) / len(group), state, t) for i, t in enumerate(group)]
+    keyed.sort(key=lambda k: (k[0], k[1]))
+    return [t for _, _, t in keyed]
+
+
+def targets(
+    conn: sqlite3.Connection, thesis: Thesis | None, seed: int = DEFAULT_SEED
+) -> list[Target]:
     rows = conn.execute(
         """SELECT c.id, c.canonical_name, c.city, c.state, c.naics_codes, c.country,
                   (SELECT json_extract(r.payload_json, '$.extra.uei') FROM company_records cr
@@ -236,10 +266,9 @@ def targets(conn: sqlite3.Connection, thesis: Thesis | None) -> list[Target]:
                 r["uei"],
             )
         )
-    # Stable pseudo-random order (hash of the key): a run that stops partway has covered all
-    # states evenly, and resuming is deterministic.
-    out.sort(key=lambda t: hashlib.sha256(t.search_key.encode()).hexdigest())
-    return out
+    # A run that stops partway (or --limit) has covered states in proportion, and resuming
+    # with the same seed continues in the same order.
+    return sample_order(out, seed)
 
 
 def check_company(
@@ -296,17 +325,54 @@ def check_company(
     return NOT_FOUND, None, None, None, log
 
 
+def _check(target: Target, fetcher: f.PoliteFetcher, resolver: Callable[[str], bool]):
+    try:
+        return check_company(target, fetcher, resolver)
+    except Exception as exc:  # one bad site must not stop an overnight run
+        return ERROR, None, None, {"error": type(exc).__name__}, []
+
+
+def _check_parallel(
+    todo: list[Target], fetchers: Sequence[f.PoliteFetcher], resolver: Callable[[str], bool]
+) -> Iterator[tuple[Target, tuple]]:
+    """Yield (target, result) as companies finish, with one company per fetcher in flight."""
+    free: queue.SimpleQueue = queue.SimpleQueue()
+    for fetcher in fetchers:
+        free.put(fetcher)
+
+    def task(t: Target):
+        fetcher = free.get()
+        try:
+            return t, _check(t, fetcher, resolver)
+        finally:
+            free.put(fetcher)
+
+    it = iter(todo)
+    with ThreadPoolExecutor(max_workers=len(fetchers), thread_name_prefix="websites") as ex:
+        pending = {ex.submit(task, t) for _, t in zip(fetchers, it, strict=False)}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.add(ex.submit(task, nxt))
+                yield fut.result()
+
+
 def run_finder(
     conn: sqlite3.Connection,
     targets_list: list[Target],
     *,
-    fetcher: f.PoliteFetcher,
+    fetcher: f.PoliteFetcher | None = None,
+    fetchers: Sequence[f.PoliteFetcher] | None = None,
     resolver: Callable[[str], bool] = dns_resolves,
     retry_errors: bool = False,
     limit: int | None = None,
     progress: Callable[[FinderStats], None] | None = None,
     progress_every: int = 10,
 ) -> FinderStats:
+    """Check companies not yet in ``website_search``. With ``fetchers`` (one per worker, sharing
+    a SiteGate) they are checked in parallel; results are saved on the calling thread."""
     done = {r[0]: r[1] for r in conn.execute("SELECT search_key, status FROM website_search")}
     stats = FinderStats(total=len(targets_list))
     todo = []
@@ -318,11 +384,12 @@ def run_finder(
             stats.already_done += 1
     if limit is not None:
         todo = todo[:limit]
-    for i, t in enumerate(todo, start=1):
-        try:
-            status, dom, conf, evidence, log = check_company(t, fetcher, resolver)
-        except Exception as exc:  # one bad site must not stop an overnight run
-            status, dom, conf, evidence, log = ERROR, None, None, {"error": type(exc).__name__}, []
+    pool = list(fetchers) if fetchers else [fetcher]
+    if len(pool) == 1:
+        results = ((t, _check(t, pool[0], resolver)) for t in todo)
+    else:
+        results = _check_parallel(todo, pool, resolver)
+    for i, (t, (status, dom, conf, evidence, log)) in enumerate(results, start=1):
         _save(conn, t, status, dom, conf, evidence, log)
         stats.checked += 1
         stats.statuses[status] = stats.statuses.get(status, 0) + 1

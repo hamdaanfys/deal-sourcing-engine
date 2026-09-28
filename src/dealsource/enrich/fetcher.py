@@ -4,6 +4,9 @@
   RFC 9309: a 4xx robots.txt allows everything; a 5xx or unreachable one disallows everything.
 - One request at a time per host, at least ``min_delay`` seconds apart, or the site's
   Crawl-delay if longer. Sites asking for more than MAX_CRAWL_DELAY are skipped.
+- Fetchers used in parallel threads share one ``SiteGate``: robots.txt, per-host timing and a
+  per-site lock (registrable domain) held across cache lookup, wait and request, so a site
+  never sees two requests at once, and a second worker gets the first one's cached answer.
 - 429/503 are retried with backoff, honouring Retry-After (capped).
 - Redirects are followed only within the company's own registrable domain.
 - Only HTML is kept, bodies over ``max_bytes`` are rejected, and every answer is cached, so a
@@ -12,6 +15,7 @@
 
 from __future__ import annotations
 
+import threading
 import urllib.robotparser
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
@@ -56,11 +60,47 @@ class PageResult:
     detail: str | None = None
 
 
+class SiteGate:
+    """Politeness state shared by all fetchers of a run (thread-safe).
+
+    Site locks are leaf locks: nothing else is acquired while one is held. The robots locks
+    (per host, so each robots.txt loads once) are taken only while holding no other lock.
+    """
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        self._robots_locks: dict[str, threading.Lock] = {}
+        self.last_request: dict[str, float] = {}
+        self.robots: dict[str, urllib.robotparser.RobotFileParser] = {}
+
+    @staticmethod
+    def site_of(url: str) -> str:
+        """The site a URL belongs to: its registrable domain, else its host."""
+        return domain_key(url) or urlsplit(url).netloc.lower()
+
+    def _lock(self, table: dict[str, threading.Lock], key: str) -> threading.Lock:
+        with self._guard:
+            lock = table.get(key)
+            if lock is None:
+                lock = table[key] = threading.Lock()
+            return lock
+
+    def site_lock(self, url: str) -> threading.Lock:
+        return self._lock(self._locks, self.site_of(url))
+
+    def robots_lock(self, host: str) -> threading.Lock:
+        return self._lock(self._robots_locks, host)
+
+
 class PoliteFetcher:
+    """Not thread-safe itself: give each thread its own fetcher, sharing one ``SiteGate``."""
+
     def __init__(
         self,
         http: CachedHttp,
         *,
+        gate: SiteGate | None = None,
         clock: Clock | None = None,
         min_delay: float = 2.0,
         max_retries: int = 2,
@@ -75,8 +115,9 @@ class PoliteFetcher:
         self.max_bytes = max_bytes
         self.timeout = timeout
         self.page_max_age = page_max_age_seconds
-        self._last_request: dict[str, float] = {}
-        self._robots: dict[str, urllib.robotparser.RobotFileParser] = {}
+        self.gate = gate or SiteGate()
+        self._last_request = self.gate.last_request
+        self._robots = self.gate.robots
         self.requests_made = 0
         self.cache_hits = 0
 
@@ -111,11 +152,12 @@ class PoliteFetcher:
             self.clock.sleep(min(backoff, MAX_RETRY_AFTER))
 
     def _get(self, url: str, max_age: float | None) -> CachedResponse:
-        hit = self.http.lookup(url, max_age_seconds=max_age)
-        if hit is not None:
-            self.cache_hits += 1
-            return hit
-        return self._request(url)
+        with self.gate.site_lock(url):
+            hit = self.http.lookup(url, max_age_seconds=max_age)
+            if hit is not None:
+                self.cache_hits += 1
+                return hit
+            return self._request(url)
 
     # -- robots.txt -----------------------------------------------------------------------
 
@@ -124,8 +166,14 @@ class PoliteFetcher:
         host = parts.netloc
         if host in self._robots:
             return self._robots[host]
+        with self.gate.robots_lock(host):
+            if host not in self._robots:
+                self._robots[host] = self._load_robots(parts.scheme, host)
+            return self._robots[host]
+
+    def _load_robots(self, scheme: str, host: str) -> urllib.robotparser.RobotFileParser:
         rp = urllib.robotparser.RobotFileParser()
-        robots_url = f"{parts.scheme}://{host}/robots.txt"
+        robots_url = f"{scheme}://{host}/robots.txt"
         try:
             resp = self._get(robots_url, ROBOTS_TTL_SECONDS)
             hops = 0
@@ -142,7 +190,6 @@ class PoliteFetcher:
                 rp.disallow_all = True
         except httpx.HTTPError:
             rp.disallow_all = True  # unreachable: assume we may not crawl
-        self._robots[host] = rp
         return rp
 
     # -- pages ----------------------------------------------------------------------------

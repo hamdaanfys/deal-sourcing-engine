@@ -2,16 +2,24 @@
 
 import csv
 import json
+import threading
+import time
+from collections import Counter, defaultdict
+from collections.abc import Callable
 
+import httpx
 import pytest
-from conftest import EXAMPLE_THESIS
+from conftest import EXAMPLE_THESIS, SiteServer
 from typer.testing import CliRunner
 
 from dealsource import cli, db
-from dealsource.enrich.fetcher import PoliteFetcher, is_cacheable_page
+from dealsource.clock import SystemClock
+from dealsource.enrich.fetcher import PoliteFetcher, SiteGate, is_cacheable_page
 from dealsource.httpcache import CachedHttp
 from dealsource.models import RawCompanyRecord
+from dealsource.resolve.normalize import domain_key
 from dealsource.resolve.pipeline import resolve
+from dealsource.score.thesis import load_thesis
 from dealsource.sources.csv_source import store_records
 from dealsource.websites import finder as wf
 from dealsource.websites.review import SampleRefused, write_sample
@@ -349,9 +357,21 @@ def test_cli_find_and_sample_print_counts_only(settings, site_server, clock, mon
         cli.app, ["websites", "find", "--thesis", str(EXAMPLE_THESIS), "--limit", "2"]
     )
     assert result.exit_code == 0, result.output
-    assert "[2/3] checked this run 2; found 1," in result.output  # order is a stable hash
-    again = runner.invoke(cli.app, ["websites", "find", "--thesis", str(EXAMPLE_THESIS)])
+    assert "[2/3] checked this run 2;" in result.output and "8 worker(s)" in result.output
+    assert "1 companies left; rerun the same command to continue." in result.output
+    conn = db.connect(settings.db_path)
+    run = json.loads(conn.execute("SELECT params_json FROM runs").fetchone()[0])
+    assert (run["limit"], run["workers"], run["seed"]) == (2, 8, wf.DEFAULT_SEED)
+    first_two = {r[0] for r in conn.execute("SELECT search_key FROM website_search")}
+    thesis, _ = load_thesis(EXAMPLE_THESIS)
+    assert first_two == {t.search_key for t in wf.targets(conn, thesis)[:2]}  # seeded order
+    conn.close()
+    again = runner.invoke(
+        cli.app, ["websites", "find", "--thesis", str(EXAMPLE_THESIS), "--workers", "2"]
+    )
+    assert again.exit_code == 0, again.output
     assert "Resumed: 2 were already checked" in again.output
+    assert "left; rerun" not in again.output
     assert "All runs so far: found 1, not_found 1, too_generic 1" in again.output
     for out in (result.output, again.output):
         assert "ACME" not in out and "acmeprecision" not in out
@@ -364,7 +384,185 @@ def test_cli_find_and_sample_print_counts_only(settings, site_server, clock, mon
     assert "ACME" not in sample.output and (settings.review_dir / "website_sample.csv").exists()
 
 
+def test_cli_find_rejects_bad_workers(settings, monkeypatch):
+    monkeypatch.setenv("DEALSOURCE_USER_AGENT_CONTACT", "https://example.org/contact")
+    for bad in (["--workers", "0"], ["--limit", "0"]):
+        result = runner.invoke(cli.app, ["websites", "find", "--thesis", str(EXAMPLE_THESIS), *bad])
+        assert result.exit_code == 2
+
+
 def test_cli_find_requires_contact_and_not_the_split(settings, monkeypatch):
     monkeypatch.delenv("DEALSOURCE_USER_AGENT_CONTACT", raising=False)
     result = runner.invoke(cli.app, ["websites", "find", "--thesis", str(EXAMPLE_THESIS)])
     assert result.exit_code == 1 and "DEALSOURCE_USER_AGENT_CONTACT" in result.output
+
+
+# --- sampling order and --limit ----------------------------------------------------------------
+
+
+def synthetic_targets(sizes: dict[str, int]) -> list[wf.Target]:
+    out, cid = [], 0
+    for state, n in sizes.items():
+        for i in range(n):
+            cid += 1
+            name = f"FICTIONAL WIDGET WORKS {state} {i:03d} LLC"
+            out.append(wf.Target(cid, wf.search_key(None, name, state), name, None, state, None))
+    return out
+
+
+def test_sample_order_is_seeded_and_spread_across_states_in_proportion():
+    sizes = {"GA": 60, "NC": 30, "SC": 10}
+    targets = synthetic_targets(sizes)
+    order = wf.sample_order(targets, seed=7)
+    assert sorted(t.search_key for t in order) == sorted(t.search_key for t in targets)
+    assert [t.search_key for t in wf.sample_order(reversed(targets), seed=7)] == [
+        t.search_key for t in order
+    ]
+    assert [t.search_key for t in wf.sample_order(targets, seed=8)] != [t.search_key for t in order]
+    # Every prefix holds each state's proportional share, give or take about one company
+    for k in range(1, len(order) + 1):
+        for state, n in sizes.items():
+            got = sum(t.state == state for t in order[:k])
+            assert abs(got - k * n / 100) < 2, (k, state, got)
+    assert {t.state for t in order[:10]} == {"GA", "NC", "SC"}
+    # Within a state the order is shuffled, not the input order
+    ga = [t.name for t in order if t.state == "GA"]
+    assert ga != sorted(ga)
+    # Adding another state leaves the relative order within existing states alone
+    more = wf.sample_order(targets + synthetic_targets({"TN": 20}), seed=7)
+    assert [t.name for t in more if t.state == "GA"] == ga
+
+
+def test_limit_then_full_run_checks_everyone_exactly_once(conn):
+    targets = wf.sample_order(synthetic_targets({"GA": 12, "NC": 6, "SC": 2}), seed=3)
+    no_dns = resolver_for()  # nothing resolves: no fetching needed
+
+    first = wf.run_finder(conn, targets, fetcher=None, resolver=no_dns, limit=5)
+    assert first.checked == 5
+    checked = {r[0] for r in conn.execute("SELECT search_key FROM website_search")}
+    assert checked == {t.search_key for t in targets[:5]}  # the start of the seeded order
+
+    second = wf.run_finder(conn, targets, fetcher=None, resolver=no_dns, limit=5)
+    assert (second.already_done, second.checked) == (5, 5)
+    checked = {r[0] for r in conn.execute("SELECT search_key FROM website_search")}
+    assert checked == {t.search_key for t in targets[:10]}
+
+    rest = wf.run_finder(conn, targets, fetcher=None, resolver=no_dns)
+    assert (rest.already_done, rest.checked) == (10, 10)
+    assert conn.execute("SELECT COUNT(*) FROM website_search").fetchone()[0] == 20
+
+
+# --- parallel workers ---------------------------------------------------------------------------
+
+WORDS = ["ACME", "BRAVO", "CEDAR", "DELTA", "EAGLE", "FALCON"]
+
+
+class ConcurrencyServer(SiteServer):
+    """A SiteServer that holds each request briefly and records overlap per site."""
+
+    def __init__(self, hold: float = 0.01):
+        super().__init__()
+        self.hold = hold
+        self._lock = threading.Lock()
+        self.in_flight: Counter = Counter()
+        self.max_per_site: Counter = Counter()
+        self.max_total = 0
+        self.started: dict[str, list[float]] = defaultdict(list)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        site = domain_key(request.url.host)
+        with self._lock:
+            self.started[request.url.host].append(time.monotonic())
+            self.in_flight[site] += 1
+            self.max_per_site[site] = max(self.max_per_site[site], self.in_flight[site])
+            self.max_total = max(self.max_total, sum(self.in_flight.values()))
+        try:
+            time.sleep(self.hold)
+            return super().handler(request)
+        finally:
+            with self._lock:
+                self.in_flight[site] -= 1
+
+
+def shared_site_setup(server: SiteServer) -> tuple[list[wf.Target], Callable[[str], bool]]:
+    """Same-name companies in GA and NC guess the same domains, so workers compete for sites.
+
+    Half the sites answer only on www., so a site is reached under two host names."""
+    live, targets, cid = set(), [], 0
+    for i, word in enumerate(WORDS):
+        name = f"{word} PRECISION MACHINING LLC"
+        dom = wf.candidate_domains(name)[0]
+        live.add(dom)
+        html = GOOD.replace("Acme", word.title())
+        server.add(f"www.{dom}" if i % 2 else dom, "/", body=html)
+        for state in ("GA", "NC"):
+            cid += 1
+            targets.append(
+                wf.Target(cid, wf.search_key(None, name, state), name, None, state, None)
+            )
+    return wf.sample_order(targets), lambda host: host in live
+
+
+def test_two_workers_never_hit_the_same_site_at_once(settings, tmp_path):
+    min_delay = 0.05
+    runs = {}
+    for workers in (1, 4):
+        server = ConcurrencyServer()
+        targets, resolver = shared_site_setup(server)
+        path = tmp_path / f"w{workers}.db"
+        conn = db.connect(path)
+        gate, conns = SiteGate(), []
+        fetchers = []
+        for _ in range(workers):
+            wconn = db.connect(path, check_same_thread=False)
+            conns.append(wconn)
+            http = CachedHttp(
+                wconn,
+                server.client(),
+                "dealsource/test (+https://example.org)",
+                cacheable=is_cacheable_page,
+            )
+            fetchers.append(
+                PoliteFetcher(http, gate=gate, clock=SystemClock(), min_delay=min_delay)
+            )
+        stats = wf.run_finder(conn, targets, fetchers=fetchers, resolver=resolver)
+        rows = dict(
+            conn.execute(
+                "SELECT search_key, status || ':' || IFNULL(domain, '') FROM website_search"
+            )
+        )
+        runs[workers] = (server, stats, rows, sum(fp.requests_made for fp in fetchers))
+        for c in [conn, *conns]:
+            c.close()
+
+    seq_server, seq_stats, seq_rows, seq_requests = runs[1]
+    par_server, par_stats, par_rows, par_requests = runs[4]
+    assert par_server.max_total >= 2  # the workers really did run at the same time...
+    assert max(par_server.max_per_site.values()) == 1  # ...but never on the same site
+    # Same results, and no site got more requests than in a sequential run
+    assert par_rows == seq_rows and par_stats.statuses == seq_stats.statuses == {
+        "found": 6,
+        "not_found": 6,
+    }
+    per_host = lambda s: Counter((r.url.host, r.url.path) for r in s.requests)  # noqa: E731
+    assert per_host(par_server) == per_host(seq_server) and par_requests == seq_requests
+    # Requests to one host stay min_delay apart (small allowance for handler entry)
+    for starts in par_server.started.values():
+        assert all(b - a >= min_delay * 0.9 for a, b in zip(starts, starts[1:], strict=False))
+
+
+def test_site_lock_covers_www_and_bare_host():
+    gate = SiteGate()
+    assert gate.site_lock("https://acme.com/") is gate.site_lock("https://www.acme.com/robots.txt")
+    assert gate.site_lock("https://acme.com/") is not gate.site_lock("https://bravo.com/")
+
+
+def test_worker_errors_are_recorded_like_sequential_ones(conn, settings, monkeypatch):
+    targets = synthetic_targets({"GA": 3, "NC": 3})
+
+    def boom(*a, **k):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(wf, "check_company", boom)
+    stats = wf.run_finder(conn, targets, fetchers=[None, None, None], resolver=resolver_for())
+    assert stats.statuses == {"error": 6} and stats.checked == 6

@@ -377,8 +377,20 @@ third-party data source, fetching only the companies' own homepages
    `error`) goes into `website_search` as soon as it's checked, together with the
    per-candidate log. A rerun skips finished companies (`--retry-errors` re-checks errors)
    and fetched pages come from the HTTP cache.
-   - Companies are processed in a stable pseudo-random order (hash of the key), so a run that
-     stops partway has covered all states evenly.
+   - **Order and `--limit N`:** companies are processed in a seeded random order (`--seed`,
+     default 20260928) spread across states in proportion to their size. Each state's
+     companies are shuffled (seeded per state) and placed at (rank + random offset) / state
+     size, so any prefix, and so any run that stops partway, holds each state's share within
+     about one company. `--limit N` checks the next N unchecked companies in that order; a
+     later run without `--limit` continues with the rest. Keep the seed the same across runs;
+     a different seed never re-checks a finished company, only changes which come next.
+   - **`--workers N`** (default 8) checks N companies in parallel threads. Each worker has its
+     own fetcher and SQLite connection; all share one `SiteGate` (robots.txt, per-host
+     delays, and a lock per site, i.e. registrable domain, so `x.com` and `www.x.com` count as
+     one). The lock is held across cache lookup, delay, request and 429/503 backoff, so a site
+     never gets two requests at once, and a worker that reaches a site another worker just
+     fetched gets the cached answer. No site gets more requests, or closer together, than in a
+     sequential run. Results are written by the main thread only.
    - Progress counts print every 10 companies; no names are printed.
 7. **Output:** a found website becomes a `websites` raw record carrying the company's UEI.
    `resolve` joins it to the company (UEI rule, §7.2), and the company becomes eligible for
@@ -394,7 +406,8 @@ third-party data source, fetching only the companies' own homepages
   - One (Steward Machine) had state evidence from a *project list* ("Mobile, AL") rather than
     an address. That's a known risk with state-only evidence; the hand-check sample measures
     it.
-  - About 5.5 s per company, so ~7 h for the 4,648 companies of the draft thesis.
+  - About 5.5 s per company sequentially, so ~7 h for the 4,648 companies of the draft
+    thesis; with 8 workers, an estimated ~1 h (about 12 min per 1,000; not yet measured).
 
 ### 6.5 OpenStreetMap makers (`dealsource discover osm`)
 
@@ -717,7 +730,8 @@ LLM calls.
 - **Page selection**: include/skip keywords match at the start of a word, so "Steam Boilers"
   isn't skipped as "team". `governance` pages (board lists) are skipped.
 - **Sequential**: companies and pages are fetched one at a time. The 4-host concurrency in
-  §8.1 isn't implemented yet; with a 2 s minimum delay (10 s for sites that ask), fetching takes
+  §8.1 isn't implemented for `enrich` yet (the website finder has parallel workers built on
+  the same fetcher, §6.4); with a 2 s minimum delay (10 s for sites that ask), fetching takes
   2–60 s per company.
 - **Contact scrubbing**: emails and phone numbers only. Street addresses aren't scrubbed
   (company addresses aren't personal data, and contact pages are never fetched).
@@ -1049,7 +1063,7 @@ The engine never collects personal contact information. It's enforced at several
 dealsource discover sam --thesis PATH [--month MM/YYYY] [--file ZIP] [--naics ..] [--state ..]
 dealsource discover usaspending --thesis PATH [--fiscal-years 5] [--naics ..] [--state ..]
 dealsource discover osm --thesis PATH [--state ..] [--refresh]
-dealsource websites find --thesis PATH [--limit N] [--retry-errors]   # resumable; progress counts
+dealsource websites find --thesis PATH [--limit N] [--workers 8] [--seed N] [--retry-errors]   # resumable
 dealsource websites sample [--n 30] [--seed N]                        # -> private/review/website_sample.csv
 dealsource labels export --thesis PATH [--n 200] [--per-state-cap N] [--seed N]   # -> private/to_label.csv
 dealsource labels split [--test-fraction 0.3] [--seed N]   # once, before enrich/score/eval
@@ -1152,3 +1166,4 @@ component (after v1).
 | 2026-09-28 | No SAM.gov key. Discovery without a key: USAspending (with award-based NAICS tags) + the strict guess-and-verify website finder (main source) + OpenStreetMap makers from Geofabrik (second source) (§6.3–6.5). |
 | 2026-09-28 | Website finder: a domain is accepted only with name AND city/state evidence; confidence and evidence are stored; uncertain → no website. Resumable with progress counts. A 30-company hand-check sample comes before labeling. |
 | 2026-09-28 | Staffing agencies are excluded (firm decision); the thesis lists the usual wordings. |
+| 2026-09-28 | Website finder: `--workers N` (default 8) checks companies in parallel with one request at a time per site (shared `SiteGate`, lock per registrable domain), so no site gets more traffic than sequentially. `--limit N` takes the next N unchecked companies in a seeded order spread across states in proportion; reruns continue with the rest (§6.4). |

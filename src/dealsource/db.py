@@ -160,11 +160,14 @@ def utcnow() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def connect(path: Path | str) -> sqlite3.Connection:
-    """Open (creating if needed) the database and apply pending migrations."""
+def connect(path: Path | str, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open (creating if needed) the database and apply pending migrations.
+
+    ``check_same_thread=False`` is for a connection handed between worker threads (one at a
+    time). Writers from several connections wait up to 30 s for the lock (WAL mode)."""
     if str(path) != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     if str(path) != ":memory:":

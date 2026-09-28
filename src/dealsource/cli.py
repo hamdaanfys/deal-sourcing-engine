@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from dealsource import db
 from dealsource.clock import SystemClock
 from dealsource.config import Settings, user_agent
-from dealsource.enrich.fetcher import PoliteFetcher, is_cacheable_page
+from dealsource.enrich.fetcher import PoliteFetcher, SiteGate, is_cacheable_page
 from dealsource.enrich.pipeline import EnrichConfig
 from dealsource.enrich.pipeline import enrich as run_enrich
 from dealsource.enrich.prompts import PROMPT_VERSION
@@ -713,8 +713,24 @@ def websites_find(
         Path, typer.Option("--thesis", help="Only companies in the thesis states and NAICS")
     ],
     limit: Annotated[
-        int | None, typer.Option(help="Check at most this many companies this run")
+        int | None,
+        typer.Option(
+            min=1,
+            help="Check only the next N unchecked companies (seeded sample, spread across states "
+            "in proportion); a later run continues with the rest",
+        ),
     ] = None,
+    workers: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=32,
+            help="Companies checked in parallel (still one request at a time per site)",
+        ),
+    ] = 8,
+    seed: Annotated[
+        int, typer.Option(help="Seed for the sampling order (keep it the same across runs)")
+    ] = website_finder.DEFAULT_SEED,
     retry_errors: Annotated[
         bool, typer.Option(help="Re-check companies whose check errored")
     ] = False,
@@ -726,7 +742,7 @@ def websites_find(
     require_contact(settings)
     thesis, thesis_hash = get_thesis(thesis_path)
     conn = open_db(settings)
-    targets = website_finder.targets(conn, thesis)
+    targets = website_finder.targets(conn, thesis, seed=seed)
 
     def progress(st: website_finder.FinderStats) -> None:
         found = st.statuses.get("found", 0)
@@ -738,38 +754,70 @@ def websites_find(
         )
 
     clock = make_clock()
-    params = {"thesis_sha256": thesis_hash, "limit": limit, "retry_errors": retry_errors}
-    with make_http_client() as client, db.record_run(conn, "websites_find", params) as stats:
-        http = CachedHttp(conn, client, user_agent(settings), cacheable=is_cacheable_page)
-        fetcher = PoliteFetcher(http, clock=clock, min_delay=settings.fetch_min_delay, timeout=10.0)
-        typer.echo(f"{len(targets):,} companies without a website in thesis states/NAICS")
-        result = website_finder.run_finder(
-            conn,
-            targets,
-            fetcher=fetcher,
-            resolver=make_resolver(),
-            retry_errors=retry_errors,
-            limit=limit,
-            progress=progress,
-        )
-        if result.already_done:
-            typer.echo(f"Resumed: {result.already_done:,} were already checked and were skipped.")
-        stats.update(
-            total=result.total,
-            already_done=result.already_done,
-            checked=result.checked,
-            statuses=result.statuses,
-            requests=fetcher.requests_made,
-            cache_hits=fetcher.cache_hits,
-        )
+    params = {
+        "thesis_sha256": thesis_hash,
+        "limit": limit,
+        "workers": workers,
+        "seed": seed,
+        "retry_errors": retry_errors,
+    }
+    gate = SiteGate()  # shared by all workers: robots.txt, per-host delays, one request per site
+    worker_conns: list[sqlite3.Connection] = []
+    fetchers: list[PoliteFetcher] = []
+    try:
+        with make_http_client() as client, db.record_run(conn, "websites_find", params) as stats:
+            for _ in range(workers):
+                wconn = db.connect(settings.db_path, check_same_thread=False)
+                worker_conns.append(wconn)
+                http = CachedHttp(wconn, client, user_agent(settings), cacheable=is_cacheable_page)
+                fetchers.append(
+                    PoliteFetcher(
+                        http,
+                        gate=gate,
+                        clock=clock,
+                        min_delay=settings.fetch_min_delay,
+                        timeout=10.0,
+                    )
+                )
+            typer.echo(
+                f"{len(targets):,} companies without a website in thesis states/NAICS; "
+                f"{workers} worker(s)"
+            )
+            result = website_finder.run_finder(
+                conn,
+                targets,
+                fetchers=fetchers,
+                resolver=make_resolver(),
+                retry_errors=retry_errors,
+                limit=limit,
+                progress=progress,
+            )
+            if result.already_done:
+                typer.echo(
+                    f"Resumed: {result.already_done:,} were already checked and were skipped."
+                )
+            stats.update(
+                total=result.total,
+                already_done=result.already_done,
+                checked=result.checked,
+                statuses=result.statuses,
+                requests=sum(fp.requests_made for fp in fetchers),
+                cache_hits=sum(fp.cache_hits for fp in fetchers),
+            )
+    finally:
+        for wconn in worker_conns:
+            wconn.close()
+    remaining = result.total - result.already_done - result.checked
     totals = dict(
         conn.execute("SELECT status, COUNT(*) FROM website_search GROUP BY status").fetchall()
     )
     typer.echo(
         "All runs so far: "
         + ", ".join(f"{k} {v:,}" for k, v in sorted(totals.items()))
-        + f" | HTTP this run: {fetcher.requests_made:,} requests, {fetcher.cache_hits:,} from cache"
+        + f" | HTTP this run: {stats['requests']:,} requests, {stats['cache_hits']:,} from cache"
     )
+    if remaining:
+        typer.echo(f"{remaining:,} companies left; rerun the same command to continue.")
     typer.echo(
         "Next: `dealsource resolve`, then `dealsource websites sample` to hand-check matches."
     )
