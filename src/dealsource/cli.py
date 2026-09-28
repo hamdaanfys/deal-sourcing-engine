@@ -39,6 +39,7 @@ from dealsource.resolve.pipeline import resolve as run_resolve
 from dealsource.score.thesis import Thesis, ThesisError, load_thesis
 from dealsource.sources.census_cbp import CensusCBPSource, CensusError, store_stats
 from dealsource.sources.csv_source import ContactColumnError, CSVSource, store_records
+from dealsource.sources.osm import OsmDownloadError, OsmSource, download_state
 from dealsource.sources.sam_extract import (
     SamError,
     SamExtractSource,
@@ -46,6 +47,8 @@ from dealsource.sources.sam_extract import (
     latest_month,
 )
 from dealsource.sources.usaspending import UsaSpendingError, UsaSpendingSource
+from dealsource.websites import finder as website_finder
+from dealsource.websites.review import SampleRefused, write_sample
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 ingest_app = typer.Typer(no_args_is_help=True, help="Load companies or market data from a source.")
@@ -54,6 +57,11 @@ discover_app = typer.Typer(
     no_args_is_help=True, help="Find candidate companies in public sources (SAM.gov, USAspending)."
 )
 app.add_typer(discover_app, name="discover")
+websites_app = typer.Typer(
+    no_args_is_help=True,
+    help="Find company websites (guess and verify) and hand-check the matches.",
+)
+app.add_typer(websites_app, name="websites")
 labels_app = typer.Typer(no_args_is_help=True, help="Analyst labels: the one-time dev/test split.")
 app.add_typer(labels_app, name="labels")
 
@@ -76,6 +84,21 @@ def make_llm_backend(settings: Settings):
 
 def make_clock():
     return SystemClock()
+
+
+def make_resolver():
+    """DNS check for candidate domains; tests replace it."""
+    return website_finder.dns_resolves
+
+
+def require_contact(settings: Settings) -> None:
+    if not settings.user_agent_contact:
+        typer.echo(
+            "Error: set DEALSOURCE_USER_AGENT_CONTACT in .env (a URL or mailbox site owners can "
+            "use to reach you); it goes in the user agent of every request.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
 
 def make_today() -> date:
@@ -380,11 +403,74 @@ def discover_usaspending(
         f"({st.requests} requests, {st.cache_hits} from cache)"
     )
     echo_per_state(st.per_state)
+    if st.retries:
+        typer.echo(f"Note: {st.retries} request(s) were retried after timeouts or server errors")
+    if st.unknown_prefixes:
+        typer.echo(
+            f"Warning: no NAICS codes found under prefix(es) {', '.join(st.unknown_prefixes)}"
+        )
     if st.truncated_states:
         typer.echo(f"Warning: results truncated for {', '.join(st.truncated_states)} (page limit)")
     typer.echo(
         f"Records: {counts['inserted']} new, {counts['updated']} updated, {counts['unchanged']} unchanged"
     )
+
+
+@discover_app.command("osm")
+def discover_osm(
+    ctx: typer.Context,
+    thesis_path: Annotated[Path, typer.Option("--thesis", help="Thesis YAML (states)")],
+    state: Annotated[
+        str | None, typer.Option(help="Override the thesis states, e.g. GA,NC")
+    ] = None,
+    refresh: Annotated[
+        bool, typer.Option(help="Download fresh extracts even if some are on disk")
+    ] = False,
+) -> None:
+    """Makers with a website from OpenStreetMap (Geofabrik state extracts; resumable downloads)."""
+    settings: Settings = ctx.obj
+    thesis, thesis_hash = get_thesis(thesis_path)
+    _, states = thesis_filters(thesis, None, state)
+    conn = open_db(settings)
+
+    def progress(p) -> None:
+        total = f"{p.total / 1e6:,.0f} MB" if p.total else "? MB"
+        resumed = f" (resumed at {p.resumed_from / 1e6:,.0f} MB)" if p.resumed_from else ""
+        typer.echo(f"  {p.state}: {p.done / 1e6:,.0f} / {total}{resumed}")
+
+    params = {"thesis_sha256": thesis_hash, "states": states, "refresh": refresh}
+    totals = {"inserted": 0, "updated": 0, "unchanged": 0}
+    with make_http_client() as client, db.record_run(conn, "discover_osm", params) as stats:
+        for st in states:
+            try:
+                path, fresh = download_state(
+                    client,
+                    st,
+                    settings.osm_dir,
+                    user_agent=user_agent(settings),
+                    refresh=refresh,
+                    progress=progress,
+                )
+            except OsmDownloadError as exc:
+                stats["error"] = str(exc)
+                typer.echo(f"Error ({st}): {exc}", err=True)
+                raise typer.Exit(1) from exc
+            source = OsmSource(path, state=st)
+            counts = store_records(conn, source.iter_records())
+            for k in totals:
+                totals[k] += counts[k]
+            s = source.stats
+            stats[st] = {"file": path.name, "kept": s.kept, "with_naics": s.with_naics}
+            typer.echo(
+                f"{st}: {path.name} ({'downloaded now' if fresh else 'on disk'}): {s.with_website:,} features "
+                f"with a website -> {s.kept:,} makers ({s.with_naics:,} with a NAICS from tags); skipped "
+                f"{s.skipped_chains:,} chains, {s.skipped_not_maker:,} non-makers, {s.skipped_no_name:,} unnamed"
+            )
+        stats.update(totals)
+    typer.echo(
+        f"Records: {totals['inserted']} new, {totals['updated']} updated, {totals['unchanged']} unchanged"
+    )
+    typer.echo("OSM data © OpenStreetMap contributors, ODbL.")
 
 
 @app.command()
@@ -439,13 +525,7 @@ def enrich(
     """Fetch each company's website politely and extract structured facts with the local LLM."""
     settings: Settings = ctx.obj
     require_split(settings)
-    if not settings.user_agent_contact:
-        typer.echo(
-            "Error: set DEALSOURCE_USER_AGENT_CONTACT in .env (a URL or mailbox site owners can "
-            "use to reach you); it goes in the user agent of every request.",
-            err=True,
-        )
-        raise typer.Exit(1)
+    require_contact(settings)
     try:
         backend = make_llm_backend(settings)
     except (RemoteHostRefused, ValueError) as exc:
@@ -624,3 +704,97 @@ def labels_export(
     typer.echo(
         f"Next: fill in the decision column (pursue/pass), save as {settings.labels_path}, run `dealsource labels split`."
     )
+
+
+@websites_app.command("find")
+def websites_find(
+    ctx: typer.Context,
+    thesis_path: Annotated[
+        Path, typer.Option("--thesis", help="Only companies in the thesis states and NAICS")
+    ],
+    limit: Annotated[
+        int | None, typer.Option(help="Check at most this many companies this run")
+    ] = None,
+    retry_errors: Annotated[
+        bool, typer.Option(help="Re-check companies whose check errored")
+    ] = False,
+) -> None:
+    """Guess .com domains for companies without a website and keep only strictly verified ones.
+
+    Resumable: each company's result is saved as soon as it is checked, and a rerun skips them."""
+    settings: Settings = ctx.obj
+    require_contact(settings)
+    thesis, thesis_hash = get_thesis(thesis_path)
+    conn = open_db(settings)
+    targets = website_finder.targets(conn, thesis)
+
+    def progress(st: website_finder.FinderStats) -> None:
+        found = st.statuses.get("found", 0)
+        typer.echo(
+            f"  [{st.already_done + st.checked:,}/{st.total:,}] checked this run {st.checked:,}; "
+            f"found {found:,}, not found {st.statuses.get('not_found', 0):,}, "
+            f"too generic {st.statuses.get('too_generic', 0):,}, ambiguous {st.statuses.get('ambiguous', 0):,}, "
+            f"errors {st.statuses.get('error', 0):,}"
+        )
+
+    clock = make_clock()
+    params = {"thesis_sha256": thesis_hash, "limit": limit, "retry_errors": retry_errors}
+    with make_http_client() as client, db.record_run(conn, "websites_find", params) as stats:
+        http = CachedHttp(conn, client, user_agent(settings), cacheable=is_cacheable_page)
+        fetcher = PoliteFetcher(http, clock=clock, min_delay=settings.fetch_min_delay, timeout=10.0)
+        typer.echo(f"{len(targets):,} companies without a website in thesis states/NAICS")
+        result = website_finder.run_finder(
+            conn,
+            targets,
+            fetcher=fetcher,
+            resolver=make_resolver(),
+            retry_errors=retry_errors,
+            limit=limit,
+            progress=progress,
+        )
+        if result.already_done:
+            typer.echo(f"Resumed: {result.already_done:,} were already checked and were skipped.")
+        stats.update(
+            total=result.total,
+            already_done=result.already_done,
+            checked=result.checked,
+            statuses=result.statuses,
+            requests=fetcher.requests_made,
+            cache_hits=fetcher.cache_hits,
+        )
+    totals = dict(
+        conn.execute("SELECT status, COUNT(*) FROM website_search GROUP BY status").fetchall()
+    )
+    typer.echo(
+        "All runs so far: "
+        + ", ".join(f"{k} {v:,}" for k, v in sorted(totals.items()))
+        + f" | HTTP this run: {fetcher.requests_made:,} requests, {fetcher.cache_hits:,} from cache"
+    )
+    typer.echo(
+        "Next: `dealsource resolve`, then `dealsource websites sample` to hand-check matches."
+    )
+
+
+@websites_app.command("sample")
+def websites_sample(
+    ctx: typer.Context,
+    n: Annotated[int, typer.Option(help="How many found websites to sample")] = 30,
+    seed: Annotated[int, typer.Option(help="Random seed")] = 20260927,
+    out: Annotated[
+        Path | None, typer.Option(help="Output CSV (default: <data dir>/review/website_sample.csv)")
+    ] = None,
+) -> None:
+    """Write a random sample of found websites to a private CSV for hand-checking (counts only here)."""
+    settings: Settings = ctx.obj
+    conn = open_db(settings)
+    out_path = out or settings.review_dir / "website_sample.csv"
+    try:
+        result = write_sample(conn, out_path, n=n, seed=seed)
+    except SampleRefused as exc:
+        typer.echo(f"Refusing: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Wrote {result.sampled} of {result.found:,} found websites to {result.path}")
+    typer.echo(
+        "  by confidence: " + ", ".join(f"{k}: {v}" for k, v in result.by_confidence.items())
+    )
+    typer.echo("  Fill in the 'correct' column (y/n) to measure precision before labeling.")

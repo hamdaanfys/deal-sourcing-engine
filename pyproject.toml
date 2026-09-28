@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "rapidfuzz>=3.9",
+    "osmium>=4.0",
     "selectolax>=0.3.21",
     "tldextract>=5.1",
     "typer>=0.12",

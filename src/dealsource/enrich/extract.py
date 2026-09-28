@@ -102,14 +102,18 @@ class PageText:
     text: str
 
 
-def extract_text(html: str) -> tuple[str, str, str]:
-    """Return (title, meta description, visible body text) with boilerplate removed."""
+def extract_text(html: str, *, keep_footer: bool = False) -> tuple[str, str, str]:
+    """Return (title, meta description, visible body text) with boilerplate removed.
+
+    keep_footer keeps <footer>/<header> text, where company addresses usually are (used to
+    verify a website's location; never sent to the LLM)."""
     tree = HTMLParser(html)
     title_node = tree.css_first("title")
     title = _clean(title_node.text()) if title_node else ""
     meta = tree.css_first('meta[name="description"]')
     description = _clean(meta.attributes.get("content") or "") if meta else ""
-    for tag in REMOVE_TAGS:
+    remove = [t for t in REMOVE_TAGS if not (keep_footer and t in ("footer", "header"))]
+    for tag in remove:
         for node in tree.css(tag):
             node.decompose()
     body = tree.body

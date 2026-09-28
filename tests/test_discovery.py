@@ -18,7 +18,7 @@ from dealsource.sources.sam_extract import (
     latest_month,
     parse_naics_string,
 )
-from dealsource.sources.usaspending import UsaSpendingSource, fiscal_year_window
+from dealsource.sources.usaspending import UsaSpendingError, UsaSpendingSource, fiscal_year_window
 
 THESIS_NAICS = ["3323", "3327", "3329", "3339"]
 THESIS_STATES = ["AL", "FL", "GA", "NC", "SC", "TN"]
@@ -202,33 +202,36 @@ def test_fiscal_year_window():
     assert fiscal_year_window(date(2026, 10, 2), 5) == ("2022-10-01", "2026-10-02")
 
 
-def test_usaspending_recipients_paginated_and_deduplicated(conn, usa_server, clock):
+def test_usaspending_queries_each_prefix_and_tags_award_naics(conn, usa_server, clock):
     source = usa_source(conn, usa_server, clock)
-    records = list(source.iter_records())
-    assert [r.source_record_id for r in records] == [
-        "SAMGA0000001",
-        "USAGA0000011",
-        "USAGA0000012",
-        "SAMNC0000002",
-    ]
-    assert records[0].extra["federal_contract_obligations_usd"] == 5164685.71
-    assert all(r.website is None for r in records)
+    records = {r.source_record_id: r for r in source.iter_records()}
+    assert list(records) == ["SAMGA0000001", "USAGA0000011", "USAGA0000012", "SAMNC0000002"]
+    acme = records["SAMGA0000001"]
+    assert acme.naics == "3327,3339"  # contracts under two thesis prefixes
+    assert acme.extra["naics_source"] == "usaspending_award_prefix"
+    assert acme.extra["federal_contract_obligations_usd"] == 5264685.71
+    assert records["SAMNC0000002"].naics == "3323"
+    assert all(r.website is None for r in records.values())
+    # One query (plus pages) per state x prefix, each with a single prefix
+    assert len(usa_server.bodies) == 2 * 4 + 1  # GA 3327 has 2 pages
+    assert {tuple(b["filters"]["naics_codes"]["require"]) for b in usa_server.bodies} == {
+        (p,) for p in THESIS_NAICS
+    }
     body = usa_server.bodies[0]
-    assert body["filters"]["naics_codes"] == {"require": THESIS_NAICS}
     assert body["filters"]["award_type_codes"] == ["A", "B", "C", "D"]
     assert body["filters"]["time_period"] == [
         {"start_date": "2021-10-01", "end_date": "2026-09-27"}
     ]
     assert source.stats.skipped_no_uei == 1
-    assert source.stats.requests == 3 and clock.sleeps == [1.0, 1.0]
+    assert source.stats.requests == 9 and clock.sleeps == [1.0] * 8
 
 
 def test_usaspending_rerun_is_cached(conn, usa_server, clock):
     list(usa_source(conn, usa_server, clock).iter_records())
     again = usa_source(conn, usa_server, clock)
     assert len(list(again.iter_records())) == 4
-    assert again.stats.requests == 0 and again.stats.cache_hits == 3
-    assert len(usa_server.bodies) == 3
+    assert again.stats.requests == 0 and again.stats.cache_hits == 9
+    assert len(usa_server.bodies) == 9
 
 
 def test_usaspending_joins_sam_on_uei_during_resolution(conn, usa_server, clock, sam_zip):
@@ -261,3 +264,59 @@ def test_usaspending_joins_sam_on_uei_during_resolution(conn, usa_server, clock,
         for r in conn.execute("SELECT payload_json FROM raw_records WHERE source = 'usaspending'")
     ]
     assert all(p["website"] is None for p in payloads)
+
+
+def test_five_digit_prefixes_are_expanded_to_their_children(conn, usa_server, clock):
+    http = CachedHttp(conn, usa_server.client(), "dealsource/test")
+    source = UsaSpendingSource(
+        http, naics_prefixes=["3327", "33992"], states=["GA"], today=date(2026, 9, 27), clock=clock
+    )
+    assert source.expand_prefix("3327") == ["3327"]
+    records = {r.source_record_id: r for r in source.iter_records()}
+    sporting = [b for b in usa_server.bodies if b["filters"]["naics_codes"]["require"] != ["3327"]]
+    assert sporting[0]["filters"]["naics_codes"]["require"] == [
+        "339920"
+    ]  # only children under 33992
+    assert usa_server.references == ["3399"]  # looked up once, then cached
+    assert records["SAMGA0000001"].naics == "3327,33992"  # tagged with the thesis prefix
+
+
+def test_prefix_without_children_is_reported_and_skipped(conn, usa_server, clock):
+    http = CachedHttp(conn, usa_server.client(), "dealsource/test")
+    source = UsaSpendingSource(
+        http, naics_prefixes=["99999"], states=["GA"], today=date(2026, 9, 27), clock=clock
+    )
+    assert list(source.iter_records()) == []
+    assert source.stats.unknown_prefixes == ["99999"]
+
+
+def test_timeouts_are_retried_then_reported(conn, usa_server, clock):
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise httpx.ReadTimeout("slow")
+        return usa_server.handler(request)
+
+    http = CachedHttp(conn, httpx.Client(transport=httpx.MockTransport(flaky)), "dealsource/test")
+    source = UsaSpendingSource(
+        http, naics_prefixes=["3323"], states=["NC"], today=date(2026, 9, 27), clock=clock
+    )
+    assert [r.source_record_id for r in source.iter_records()] == ["SAMNC0000002", "SAMGA0000001"]
+    assert source.stats.retries == 2 and 10.0 in clock.sleeps and 20.0 in clock.sleeps
+
+    def always_slow(request):
+        raise httpx.ReadTimeout("slow")
+
+    dead = UsaSpendingSource(
+        CachedHttp(
+            conn, httpx.Client(transport=httpx.MockTransport(always_slow)), "dealsource/test"
+        ),
+        naics_prefixes=["3327"],
+        states=["GA"],
+        today=date(2026, 9, 27),
+        clock=clock,
+    )
+    with pytest.raises(UsaSpendingError, match="after 3 attempts"):
+        list(dead.iter_records())

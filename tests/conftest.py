@@ -271,16 +271,36 @@ def sam_zip(tmp_path) -> Path:
 class UsaSpendingServer:
     """Serves saved recipient pages keyed by (state, page); logs request bodies."""
 
-    PAGES = {("GA", 1): "ga_page1.json", ("GA", 2): "ga_page2.json", ("NC", 1): "nc_page1.json"}
+    # (state, NAICS prefix, page) -> fixture. Acme appears under two prefixes in GA.
+    PAGES = {
+        ("GA", "3327", 1): "ga_page1.json",
+        ("GA", "3327", 2): "ga_page2.json",
+        ("GA", "3339", 1): "ga_3339.json",
+        ("NC", "3323", 1): "nc_page1.json",
+        ("GA", "33992", 1): "ga_3339.json",  # Acme again, now under sporting goods
+    }
 
     def __init__(self):
         self.bodies: list[dict] = []
+        self.references: list[str] = []
+
+    # NAICS reference answers (API shape: results[0].children[].naics)
+    REFERENCE = {"3399": ["339910", "339920", "339930"]}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/references/naics/" in request.url.path:
+            code = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+            children = [
+                {"naics": c, "naics_description": "x"} for c in self.REFERENCE.get(code, [])
+            ]
+            self.references.append(code)
+            return httpx.Response(200, json={"results": [{"naics": code, "children": children}]})
         body = json.loads(request.content)
         self.bodies.append(body)
         state = body["filters"]["recipient_locations"][0]["state"]
-        name = self.PAGES.get((state, body["page"]))
+        codes = body["filters"]["naics_codes"]["require"]
+        prefix = "33992" if codes == ["339920"] else codes[0]
+        name = self.PAGES.get((state, prefix, body["page"]))
         if name is None:
             return httpx.Response(200, json={"results": [], "page_metadata": {"hasNext": False}})
         return httpx.Response(200, content=(FIXTURES / "usaspending" / name).read_bytes())

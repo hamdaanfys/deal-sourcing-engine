@@ -1,0 +1,36 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- Synthetic OSM data (fictional businesses) in OSM XML format. -->
+<osm version="0.6" generator="dealsource-tests">
+ <node id="101" version="1" lat="32.84" lon="-83.63">
+  <tag k="name" v="Ocmulgee Brewing Co"/><tag k="craft" v="brewery"/>
+  <tag k="website" v="https://www.ocmulgeebrewing.test/"/><tag k="addr:city" v="Macon"/>
+  <tag k="phone" v="+1 478 555 0101"/><tag k="email" v="owner@ocmulgeebrewing.test"/>
+ </node>
+ <node id="102" version="1" lat="32.85" lon="-83.64">
+  <tag k="name" v="Peach State Fabricators"/><tag k="craft" v="metal_construction"/>
+  <tag k="contact:website" v="peachstatefab.test"/>
+ </node>
+ <way id="201" version="1">
+  <nd ref="101"/><nd ref="102"/>
+  <tag k="name" v="Dalton Carpet Mill"/><tag k="man_made" v="works"/><tag k="product" v="carpet"/>
+  <tag k="website" v="https://daltoncarpetmill.test"/>
+ </way>
+ <way id="202" version="1">
+  <nd ref="101"/><nd ref="102"/>
+  <tag k="name" v="Savannah Precision Machine"/><tag k="industrial" v="machine_shop"/>
+  <tag k="website" v="https://savannahprecision.test"/>
+ </way>
+ <node id="103" version="1" lat="33.75" lon="-84.39">
+  <tag k="name" v="Big Chain Bakery #42"/><tag k="shop" v="bakery"/><tag k="craft" v="bakery"/>
+  <tag k="brand" v="Big Chain Bakery"/><tag k="website" v="https://bigchainbakery.test"/>
+ </node>
+ <node id="104" version="1" lat="33.75" lon="-84.39">
+  <tag k="name" v="Corner Coffee"/><tag k="amenity" v="cafe"/><tag k="website" v="https://cornercoffee.test"/>
+ </node>
+ <node id="105" version="1" lat="33.75" lon="-84.39">
+  <tag k="craft" v="winery"/><tag k="website" v="https://nameless.test"/>
+ </node>
+ <node id="106" version="1" lat="33.75" lon="-84.39">
+  <tag k="name" v="No Website Works"/><tag k="man_made" v="works"/>
+ </node>
+</osm>

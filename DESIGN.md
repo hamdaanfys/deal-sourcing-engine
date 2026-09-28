@@ -119,6 +119,8 @@ deal-sourcing-engine/
 | Sample to label (exported) | `private/to_label.csv` | **no** |
 | Analyst labels | `private/labels.csv` | **no** |
 | SAM.gov extract ZIPs | `private/cache/sam/` | **no** |
+| Geofabrik OSM extracts | `private/cache/osm/` | **no** |
+| Website hand-check sample | `private/review/website_sample.csv` | **no** |
 | Dev/test split record (manifest + assignments) | `private/labels_split.json` | **no** |
 | Evaluation log and company-level eval reports | `private/evals/` | **no** |
 | SQLite DB (includes all caches) | `private/dealsource.db` | **no** (also `*.db` is ignored) |
@@ -307,13 +309,23 @@ Lists you're licensed to use still come in through `ingest csv`.
 - No API key. The source uses `POST /api/v2/search/spending_by_category/recipient/`, one row
   per recipient with UEI and total obligations, with these filters:
   - contracts (award types A–D)
-  - `naics_codes.require` = the thesis prefixes
   - recipient location = each thesis state
   - the last 5 federal fiscal years, including the current one
+  - **one query per thesis NAICS prefix**, so each recipient is tagged with the prefixes it won
+    contracts under. This goes in the record's `naics`, with
+    `extra.naics_source = "usaspending_award_prefix"`. It's award-based NAICS, not the
+    company's registered NAICS, but it's what makes USAspending records eligible for the
+    labeling export.
+- The API accepts only 2-, 4- or 6-digit NAICS codes. A 3- or 5-digit thesis prefix (e.g.
+  `33992`) is expanded to its exact child codes through
+  `/api/v2/references/naics/<parent>/` (looked up once and cached). The recipient is still
+  tagged with the thesis prefix.
+- Timeouts, connection errors and 5xx responses are retried up to 3 times (10 s, then 20 s).
+  After that the run stops with a message; a rerun resumes from the cache.
 - Requests are 100 per page, at most 50 pages per state, and at least 1 s apart. POST bodies
   are cached (`CachedHttp.post_json`), so a rerun makes no requests.
-- These records have **no website and no city**. They join the matching SAM.gov record by UEI
-  during resolution (§7.2), which supplies both. They also add a federal-contract revenue
+- These records have **no website and no city**. Websites come from the website finder (§6.4)
+  or, if a SAM.gov key is available, from the matching SAM.gov record (joined by UEI, §7.2). They also add a federal-contract revenue
   signal (`extra.federal_contract_obligations_usd`).
 
 **Limitation: coverage skews toward federal contractors.** SAM.gov and USAspending only
@@ -322,6 +334,91 @@ toward industrial, defense and government suppliers, and consumer-facing compani
 beverage brands, consumer products, retail-oriented manufacturers) are under-represented. The
 labeling sample and every metric built on it inherit this skew. Fill gaps with lists you're
 licensed to use via `ingest csv`.
+
+### 6.4 Website finder: guess and verify (`dealsource websites find`)
+
+Without a SAM.gov key, USAspending records have no websites. The finder adds them without any
+third-party data source, fetching only the companies' own homepages
+(`websites/finder.py`):
+
+1. **Candidates:** up to 4 `.com` domains built from the name, after dropping legal suffixes
+   and "and"/"the": all words joined, hyphenated, with abbreviations (`manufacturing` → `mfg`,
+   …), and the first two words.
+   - A name with no distinctive word of 4+ letters (e.g. "ACE INDUSTRIES", "GLOBAL SOLUTIONS
+     GROUP") is **too generic** and isn't guessed at all.
+   - A candidate is fetched only if it exists in DNS.
+2. **Fetch:** the homepage only, through the polite fetcher (robots.txt, per-host delay,
+   cache). Tries `https://`, then `https://www.`, then `http://`.
+   - A redirect to another domain is verified on its own merits.
+   - A redirect to a platform (Facebook, Wix, …) counts as no website.
+3. **Strict verification.** Both are required, from text that includes the footer (where
+   addresses usually are):
+   - **Name:** a title or `og:site_name` segment scores ≥ 93 against the company name, or
+     every distinctive word of the name appears on the page (at least two words, or one of
+     6+ letters).
+   - **Location:** the company's city (when known), or its state as `, GA`, `GA 31201` or the
+     full state name. Upper-case codes only, so "ga ga" doesn't count.
+
+   Parked or for-sale pages are rejected.
+4. **Confidence** (stored with the evidence):
+
+   | Name evidence | Location evidence | Confidence |
+   |---|---|---|
+   | title | city | 0.95 |
+   | title | state | 0.90 |
+   | body | city | 0.85 |
+   | body | state | 0.75 |
+
+   Evidence stored: page title, match types, name score, and a short location snippet with
+   contact details scrubbed.
+5. **Anything uncertain gets no website:** name without location, location without name, or
+   two *different* verified domains (`ambiguous`).
+6. **Resumable:** each company's result (`found`, `not_found`, `too_generic`, `ambiguous`,
+   `error`) goes into `website_search` as soon as it's checked, together with the
+   per-candidate log. A rerun skips finished companies (`--retry-errors` re-checks errors)
+   and fetched pages come from the HTTP cache.
+   - Companies are processed in a stable pseudo-random order (hash of the key), so a run that
+     stops partway has covered all states evenly.
+   - Progress counts print every 10 companies; no names are printed.
+7. **Output:** a found website becomes a `websites` raw record carrying the company's UEI.
+   `resolve` joins it to the company (UEI rule, §7.2), and the company becomes eligible for
+   the labeling export.
+8. **Hand-check before labeling:** `dealsource websites sample [--n 30]` writes a random
+   sample of found websites to `private/review/website_sample.csv` (name, city, state,
+   website, confidence, evidence, and an empty `correct` column). It prints counts only.
+
+**Measured:**
+- **2026-09-27 experiment** (25 Georgia recipients): 28% verified with name-or-title matching
+  alone, 20% when state evidence was also required.
+- **2026-09-28 live smoke test** (20 companies): 5 found (25%) and all 5 looked correct.
+  - One (Steward Machine) had state evidence from a *project list* ("Mobile, AL") rather than
+    an address. That's a known risk with state-only evidence; the hand-check sample measures
+    it.
+  - About 5.5 s per company, so ~7 h for the 4,648 companies of the draft thesis.
+
+### 6.5 OpenStreetMap makers (`dealsource discover osm`)
+
+`sources/osm.py` downloads each thesis state's extract from Geofabrik
+(`download.geofabrik.de/north-america/us/<state>-latest.osm.pbf`) into `private/cache/osm/`
+and reads it locally with pyosmium. We don't use the public Overpass server, which asks
+commercial users to self-host.
+
+- **Download:**
+  - Resumable: a `.part` file pinned to the dated file URL behind `-latest`, continued with an
+    HTTP `Range` request, restarting cleanly if the server ignores it.
+  - Verified against Geofabrik's `.md5`.
+  - Reused until `--refresh`.
+- **Kept:** named features with `website`/`contact:website` that are makers: `man_made=works`,
+  manufacturing-type `industrial=*`, or maker crafts (brewery, winery, distillery, metal
+  construction, cabinet maker, …). Chains (`brand=*`) are skipped.
+- **NAICS:** set where a tag maps clearly (e.g. `craft=brewery` → 312120,
+  `industrial=machine_shop` → 332710); otherwise none, and the company isn't export-eligible.
+- **Tags read:** only name, website, city and the classifying tags. Phone and email tags are
+  never read.
+- **Licence:** OSM data is © OpenStreetMap contributors, ODbL. Internal use is fine; anything
+  published from it needs attribution and share-alike.
+- **Measured in Georgia (2026-09-27):** 211 distinct maker domains, including breweries,
+  wineries and distilleries. Those consumer makers partly offset the federal-contractor skew.
 
 ## 7. Stage 2: Resolve (entity resolution)
 
@@ -951,6 +1048,9 @@ The engine never collects personal contact information. It's enforced at several
 ```
 dealsource discover sam --thesis PATH [--month MM/YYYY] [--file ZIP] [--naics ..] [--state ..]
 dealsource discover usaspending --thesis PATH [--fiscal-years 5] [--naics ..] [--state ..]
+dealsource discover osm --thesis PATH [--state ..] [--refresh]
+dealsource websites find --thesis PATH [--limit N] [--retry-errors]   # resumable; progress counts
+dealsource websites sample [--n 30] [--seed N]                        # -> private/review/website_sample.csv
 dealsource labels export --thesis PATH [--n 200] [--per-state-cap N] [--seed N]   # -> private/to_label.csv
 dealsource labels split [--test-fraction 0.3] [--seed N]   # once, before enrich/score/eval
 dealsource labels status                                   # aggregate counts only
@@ -1049,3 +1149,6 @@ component (after v1).
 | 2026-09-27 | Discovery, ingest, resolve and `labels export` run before the split; enrich, score, export and eval stay gated. The split now refuses only if a stage that could influence labels has run (§11.3). |
 | 2026-09-27 | `labels export`: 200 companies with websites, thesis NAICS and states, spread across states with a per-state cap; the file has only company_name, website, state and an empty decision (§11.0). |
 | 2026-09-27 | Known limitation: candidates skew toward federal contractors (industrial) and under-represent consumer companies (§6.3). |
+| 2026-09-28 | No SAM.gov key. Discovery without a key: USAspending (with award-based NAICS tags) + the strict guess-and-verify website finder (main source) + OpenStreetMap makers from Geofabrik (second source) (§6.3–6.5). |
+| 2026-09-28 | Website finder: a domain is accepted only with name AND city/state evidence; confidence and evidence are stored; uncertain → no website. Resumable with progress counts. A 30-company hand-check sample comes before labeling. |
+| 2026-09-28 | Staffing agencies are excluded (firm decision); the thesis lists the usual wordings. |

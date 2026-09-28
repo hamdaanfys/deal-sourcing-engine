@@ -140,6 +140,19 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (api, day)
     );
     """,
+    # 4: website finder (one row per company, written as soon as that company is done)
+    """
+    CREATE TABLE website_search (
+        search_key TEXT PRIMARY KEY,
+        company_id INTEGER,
+        status TEXT NOT NULL,
+        domain TEXT,
+        confidence REAL,
+        evidence_json TEXT,
+        candidates_json TEXT NOT NULL,
+        finished_at TEXT NOT NULL
+    );
+    """,
 ]
 
 

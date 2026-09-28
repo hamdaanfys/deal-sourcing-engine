@@ -1,0 +1,4 @@
+{"category":"recipient","spending_level":"transactions","limit":100,"page_metadata":{"page":1,"next":null,"previous":null,"hasNext":false,"hasPrevious":false},
+ "results":[
+  {"amount":100000.0,"recipient_id":"a1-C","name":"ACME PRECISION MACHINING LLC","code":null,"uei":"SAMGA0000001","total_outlays":null}
+ ],"messages":[]}

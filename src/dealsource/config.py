@@ -69,6 +69,10 @@ class Settings:
         return self.data_dir / "to_label.csv"
 
     @property
+    def osm_dir(self) -> Path:
+        return self.data_dir / "cache" / "osm"
+
+    @property
     def sam_dir(self) -> Path:
         return self.data_dir / "cache" / "sam"
 

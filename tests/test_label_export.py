@@ -220,7 +220,9 @@ def test_cli_discover_usaspending(settings, usa_server, monkeypatch, clock):
         cli.app, ["discover", "usaspending", "--thesis", str(EXAMPLE_THESIS), "--state", "GA,NC"]
     )
     assert result.exit_code == 0, result.output
-    assert "4 recipients (3 requests, 0 from cache)" in result.output
+    assert (
+        "4 recipients (42 requests, 0 from cache)" in result.output
+    )  # 20 prefixes x 2 states + 1 extra page + 1 NAICS lookup (33992 -> 6-digit codes)
     assert "GREENE" not in result.output
 
 
