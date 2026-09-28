@@ -7,7 +7,9 @@ from dealsource.score.thesis import ThesisError, load_thesis
 def test_example_thesis_loads():
     thesis, digest = load_thesis(EXAMPLE_THESIS)
     assert thesis.geography.states == ["AL", "FL", "GA", "NC", "SC", "TN"]
-    assert thesis.sectors.naics_prefixes == ["3323", "3327", "3329", "3339"]
+    assert {"3323", "3327", "3339", "3119", "3121"} <= set(thesis.sectors.naics_prefixes)
+    assert thesis.size.employees.min == 20 and thesis.size.employees.max == 250
+    assert thesis.exclusions.ownership == ["pe_or_strategic_backed", "publicly_traded"]
     assert len(digest) == 64
 
 

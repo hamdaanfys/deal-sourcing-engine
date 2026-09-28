@@ -1,25 +1,159 @@
-# Example thesis (fictional). Real theses live in private/theses/ and are never committed.
-name: "Example: Niche Industrial Manufacturing, Southeast US"
+# DRAFT example thesis: lower-middle-market (LMM) PE / search-fund style buyer of US
+# industrial and consumer-products businesses. Public example only; a firm's real thesis
+# lives in private/theses/ and is never committed.
+#
+# Every choice below cites the public source behind it. Where a choice is a judgment call
+# rather than something a source states, the comment says so.
+#
+# Sources (accessed 2026-09-27):
+#  [S1] Stanford GSB, "2024 Search Fund Study: Selected Observations" (CASE E-870, June 2024),
+#       https://www.gsb.stanford.edu/experience/about/centers-institutes/ghces/research/search-funds
+#       (PDF mirror: https://www.onetoonefunds.com/wp-content/uploads/sites/11/2024/10/2024_Search-Fund-Study_Selected-Observations_Stanford-GSB.pdf)
+#       - median acquired company: 40 employees (range 4-2,500), $7.3M revenue, $1.9M EBITDA,
+#         22.8% EBITDA margin; 2022-23 cohort median 34 employees (Exhibit 5)
+#       - searchers target industries "not subject to rapid technological change",
+#         "fragmented geographical or product markets", "history of positive, stable cash
+#         flows", and "prefer healthy, profitable companies over turnaround situations" (App. A)
+#       - seller median age 55 (Seller Demographics)
+#  [S2] Axial, "The Top 50 Lower Middle Market Industrials Investors & M&A Advisors [2026]"
+#       and "Who's Buying in the Lower Middle Market in 2026?",
+#       https://www.axial.net/forum/the-top-50-lower-middle-market-industrials-investors-ma-advisors-2026/
+#       https://www.axial.net/forum/whos-buying-in-the-lower-middle-market-in-2026-key-buyer-trends-from-axial-data/
+#       (NOTE: axial.net blocked automated fetching; these figures are from search-result
+#       excerpts of these pages. Verify in a browser before relying on them.)
+#       - Industrials rank #1 in both deal volume and buyer interest (>25% of deals);
+#         top sub-sectors: HVAC, Construction & Engineering, Electrical Equipment,
+#         Machinery & Equipment, with Aerospace & Defense prominent; Consumer Goods ranks #3
+#  [S3] CapitalPad, "Lower Middle Market Private Equity: Size, Buyers, Multiples",
+#       https://capitalpad.com/lower-middle-market-private-equity/
+#       - LMM: privately held businesses with $10-100M revenue, $2-10M EBITDA, 50-500
+#         employees, often founder-led; niche/specialty manufacturing named as a fit
+#  [S4] GF Data (ACG), https://middlemarketgrowth.org/gf-data/ and
+#       https://capitalpad.com/lower-middle-market-ebitda-multiples/
+#       - LMM = $10-250M enterprise value; PE-sponsored deals tracked $10-500M
+#  [S5] Project Equity, "Silver Tsunami", https://project-equity.org/impact/silver-tsunami/
+#       and the 2.3M-businesses press release,
+#       https://project-equity.org/press-releases/2-3-million-small-businesses-nationwide-owned-by-aging-boomers-preparing-to-retire-puts-1-in-6-employees-jobs-at-risk-based-on-a-project-equity-study/
+#       - over half of privately held employer businesses have owners over 55; 2.3M
+#         (44.7%) are owned by baby boomers preparing to retire
+#  [S6] U.S. BLS, Monthly Labor Review (2021), "Manufacturing employment in the Southeast:
+#       examining the last 30 years",
+#       https://www.bls.gov/opub/mlr/2021/article/manufacturing-employment-in-the-southeast-examining-the-last-30-years.htm
+#       - NC (11.1%), GA (9.3%), FL (9.0%) and TN (8.2%) are among the five largest shares
+#         of Southeast manufacturing employment (2019); transportation equipment and food
+#         manufacturing grew 2001-2019
+#  [S7] U.S. FTC, Franchise Rule (16 CFR 436), Item 17 "Renewal, Termination, Transfer and
+#       Dispute Resolution", https://www.ftc.gov/legal-library/browse/rules/franchise-rule
+#       - franchise agreements govern transfer of the business, i.e. the franchisor
+#         typically has a say in who can buy it
+
+name: "Example: LMM US industrial & consumer products, Southeast"
+
 sectors:
-  naics_prefixes: ["3323", "3327", "3329", "3339"]   # metal fabrication, machine shops, other fabricated metal, other machinery
-  include_keywords: ["precision machining", "fabrication", "industrial equipment"]
-  end_markets: ["aerospace", "medical devices", "food processing"]
+  # NAICS prefixes: a company matches if any of its NAICS codes starts with one of these.
+  naics_prefixes:
+    # --- Industrials: the #1 LMM sector by deals and buyer interest [S2]; fragmented, slow
+    #     technological change, stable cash flow [S1]; specialty manufacturing [S3]
+    - "3323"    # Architectural & structural metals (fabrication)
+    - "3327"    # Machine shops; turned products; screws, nuts & bolts
+    - "3328"    # Coating, engraving, heat treating & allied activities
+    - "3329"    # Other fabricated metal products (valves, fittings, etc.)
+    - "3261"    # Plastics products (molders; judgment call: a common niche-manufacturing sub-sector)
+    - "3334"    # HVAC & commercial refrigeration equipment (HVAC is the top 2026 sub-sector [S2])
+    - "3339"    # Other general-purpose machinery (pumps, conveyors, packaging machinery) [S2 "Machinery & Equipment"]
+    - "3335"    # Metalworking machinery (tool & die, molds) [S2 "Machinery & Equipment"]
+    - "3345"    # Navigational, measuring & control instruments (judgment call: niche, sticky B2B)
+    - "3353"    # Electrical equipment (switchgear, transformers) [S2 "Electrical Equipment"]
+    - "336413"  # Other aircraft parts & auxiliary equipment [S2 "Aerospace & Defense"]
+    - "4238"    # Machinery, equipment & supplies merchant wholesalers (value-added distribution) [S3]
+    - "811310"  # Commercial & industrial machinery repair & maintenance (industrial services) [S2]
+    # --- Consumer products: Consumer Goods ranks #3 in LMM deal flow [S2]; food
+    #     manufacturing grew in the Southeast [S6]
+    - "3119"    # Other food manufacturing (snacks, sauces, spices, specialty foods)
+    - "3118"    # Bakeries & tortilla manufacturing
+    - "3121"    # Beverage manufacturing (craft beverages, bottlers)
+    - "311111"  # Dog & cat food
+    - "3256"    # Soap, cleaning compounds & personal-care products
+    - "33992"   # Sporting & athletic goods
+    - "3371"    # Household & institutional furniture (judgment call: branded consumer durables)
+  # Positive signals looked for in website text and extracted product lines. These are
+  # also the "nice-to-haves" (judgment calls informed by [S1] "sustainable market position"
+  # and [S3] "niche markets").
+  include_keywords:
+    - "precision machining"
+    - "custom fabrication"
+    - "contract manufacturing"
+    - "private label"
+    - "co-packing"
+    - "made in usa"
+    - "iso 9001"
+    - "as9100"
+    - "aftermarket"
+    - "replacement parts"
+    - "service contracts"
+    - "maintenance agreements"
+  end_markets:
+    - "aerospace"
+    - "defense"
+    - "medical devices"
+    - "food and beverage"
+    - "hvac"
+    - "industrial automation"
+    - "energy"
+    - "water"
+    - "specialty retail"
+    - "pet"
+
 size:
+  # 20-250 employees spans search-fund targets (median 34-40 employees [S1]) and the lower
+  # part of LMM PE (50-500 employees [S3]); above ~250 a company is usually past LMM
+  # EBITDA ranges (judgment call).
   employees: {min: 20, max: 250}
-  facilities: {min: 1, max: 8}
-  revenue_usd_m: {min: 5, max: 75}    # applied only when a CSV supplies revenue
+  # Single-site to small multi-site operators (judgment call; more than ~10 plants
+  # usually means a larger platform).
+  facilities: {min: 1, max: 10}
+  # Only applied when a CSV supplies revenue. $5-100M covers the search-fund median of $7.3M
+  # [S1] through the LMM upper bound of ~$100M [S3].
+  revenue_usd_m: {min: 5, max: 100}
+
 geography:
   countries: ["US"]
+  # Southeast manufacturing base: NC, GA, FL and TN hold four of the five largest shares
+  # of Southeast manufacturing employment [S6]; SC and AL added as neighbouring states with
+  # large manufacturing bases (judgment call). Replace with your firm's footprint.
   states: ["GA", "FL", "NC", "SC", "TN", "AL"]
+
 ownership:
+  # Founder- and family-owned: most LMM targets are founder-led [S3]; over half of employer
+  # businesses have owners over 55 and 2.3M boomer owners are preparing to retire [S5];
+  # search-fund sellers' median age is 55 [S1].
   prefer: ["founder_led", "family_owned"]
+
 exclusions:
-  keywords: ["franchise", "staffing agency"]
+  # Deal-breakers. Any hit excludes the company, with the reason shown in the export.
+  keywords:
+    - "franchise"            # franchisor controls transfer of the business [S7]
+    - "franchisee"
+    - "staffing agency"      # firm decision (2026-09-27): staffing businesses are excluded
+    - "staffing services"
+    - "staffing firm"
+    - "temporary staffing"
+    - "temp agency"
+    - "employment agency"
+    - "chapter 11"           # turnarounds are avoided [S1]
+    - "bankruptcy"
+    - "receivership"
+  # Already institutionally owned or public: outside the private, founder-owned LMM universe
+  # [S3]; a PE-backed company is a secondary sale with a different process (judgment call).
   ownership: ["pe_or_strategic_backed", "publicly_traded"]
-  domains: []
+  domains: []                # e.g. existing portfolio companies, known passes
+
 weights:
+  # Judgment call: industry fit matters most; size, geography and ownership equally.
   sector: 0.40
   size: 0.20
   geography: 0.20
   ownership: 0.20
+
+# Scores at or above this are "shortlisted" (used by eval). Revisit with the dev labels.
 shortlist_threshold: 60
