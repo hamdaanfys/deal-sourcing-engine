@@ -22,7 +22,7 @@ from dealsource.resolve.pipeline import resolve
 from dealsource.score.thesis import load_thesis
 from dealsource.sources.csv_source import store_records
 from dealsource.websites import finder as wf
-from dealsource.websites.review import SampleRefused, write_sample
+from dealsource.websites.review import SampleRefused, refresh_sample, write_sample
 
 GOOD = """<html><head><title>Acme Precision Machining | CNC Machining in Macon</title></head>
 <body><main><p>Tight-tolerance parts for aerospace.</p></main>
@@ -104,6 +104,30 @@ def test_state_evidence_when_city_unknown():
 def test_uncertain_pages_are_rejected(html, reason):
     conf, ev = wf.verify_page(html, target())
     assert conf == 0.0 and ev["rejected"] == reason
+
+
+def test_snippet_never_holds_part_of_a_phone_number_or_email_cut_at_its_edges():
+    # The phone number ends just inside the 40-character window before ", GA" and the email
+    # starts just inside the window after it; scrubbing after the cut would leave
+    # "55-0101" and "sales@acmepr" behind.
+    html = f"""<html><head><title>Acme Precision Machining</title></head><body><p>Parts.</p>
+<footer>Call 478-555-0101 {"x" * 26} Macon, GA 31201 {"y" * 20} sales@acmeprecisionmachining.com
+</footer></body></html>"""
+    conf, ev = wf.verify_page(html, target(city=None))
+    snippet = ev["location_snippet"]
+    assert conf == 0.90 and ", GA 31201" in snippet
+    assert "0101" not in snippet and "555" not in snippet
+    assert "@" not in snippet and "sales" not in snippet
+
+
+def test_page_title_is_scrubbed_before_it_is_shortened():
+    title = "Acme Precision Machining " + "z" * 90 + " 478-555-0101 today"  # cut at 120: " 478-"
+    html = GOOD.replace(
+        "<title>Acme Precision Machining | CNC Machining in Macon</title>",
+        f"<title>{title}</title>",
+    )
+    ev = wf.verify_page(html, target())[1]
+    assert len(ev["page_title"]) <= 120 and "478" not in ev["page_title"]
 
 
 def test_lowercase_state_code_is_not_evidence():
@@ -410,6 +434,39 @@ def test_sample_leaves_out_companies_from_earlier_samples(conn, tmp_path, site_s
     old = {r["website"] for r in csv.DictReader((tmp_path / "first.csv").open())}
     new = {r["website"] for r in csv.DictReader((tmp_path / "second.csv").open())}
     assert first.sampled == 1 and not old & new
+
+
+def test_refresh_sample_rewrites_evidence_and_keeps_rows_and_verdicts(
+    conn, tmp_path, site_server, clock
+):
+    seed_companies(conn)
+    site_server.add("acmeprecisionmachining.com", "/", body=GOOD)
+    wf.run_finder(
+        conn,
+        [target()],
+        fetcher=fetcher_for(conn, site_server, clock),
+        resolver=resolver_for("acmeprecisionmachining.com"),
+    )
+    path = tmp_path / "s.csv"
+    write_sample(conn, path)
+    rows = list(csv.DictReader(path.open()))
+    rows[0]["location_snippet"] = "55-0101 Macon, GA 31201 sales@acmepr"  # stored before the fix
+    rows[0]["correct"] = "y"
+    rows.append(dict(rows[0], company_name="GONE LLC", website="https://gone-example.com"))
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+    result = refresh_sample(conn, path)
+    assert (result.rows, result.changed, result.no_longer_found) == (2, 2, 1)
+    out = list(csv.DictReader(path.open()))
+    assert [r["company_name"] for r in out] == [r["company_name"] for r in rows]
+    assert [r["correct"] for r in out] == ["y", "y"]
+    assert "0101" not in out[0]["location_snippet"] and "@" not in out[0]["location_snippet"]
+    assert out[1]["location_snippet"] == "(no longer found)" and out[1]["confidence"] == ""
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 # --- recheck with current rules ----------------------------------------------------------

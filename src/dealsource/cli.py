@@ -48,7 +48,7 @@ from dealsource.sources.sam_extract import (
 )
 from dealsource.sources.usaspending import UsaSpendingError, UsaSpendingSource
 from dealsource.websites import finder as website_finder
-from dealsource.websites.review import SampleRefused, write_sample
+from dealsource.websites.review import SampleRefused, refresh_sample, write_sample
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 ingest_app = typer.Typer(no_args_is_help=True, help="Load companies or market data from a source.")
@@ -855,6 +855,30 @@ def websites_recheck(ctx: typer.Context) -> None:
             f"  not replayable from the cache (left as they were): {result.not_replayable:,}"
         )
     typer.echo("Next: `dealsource resolve` so companies pick up the changes.")
+
+
+@websites_app.command("refresh-sample")
+def websites_refresh_sample(
+    ctx: typer.Context,
+    path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="A sample CSV to refresh")
+    ],
+) -> None:
+    """Rewrite a sample's evidence columns from the current database (counts only here).
+
+    Rows and the 'correct' column are kept; only confidence, match types, page title and
+    location snippet are replaced."""
+    settings: Settings = ctx.obj
+    conn = open_db(settings)
+    try:
+        result = refresh_sample(conn, path)
+    except SampleRefused as exc:
+        typer.echo(f"Refusing: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        f"Refreshed {path}: {result.rows} rows, {result.changed} with changed evidence, "
+        f"{result.no_longer_found} no longer found"
+    )
 
 
 @websites_app.command("sample")

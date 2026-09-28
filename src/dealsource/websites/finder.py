@@ -157,9 +157,11 @@ def _site_names(html: str, title: str) -> list[str]:
     return names
 
 
-def _snippet(text: str, start: int, end: int) -> str:
-    s = text[max(0, start - 40) : min(len(text), end + 40)].replace("\n", " ")
-    return scrub_contact_info(re.sub(r"\s+", " ", s).strip())
+def _snippet(clean: str, start: int, end: int) -> str:
+    """Up to 40 characters either side of the match. ``clean`` must already be scrubbed:
+    scrubbing after the cut would miss a phone number or email split by it."""
+    s = clean[max(0, start - 40) : min(len(clean), end + 40)].replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def verify_page(html: str, target: Target) -> tuple[float, dict]:
@@ -191,13 +193,16 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
     else:
         name_match = "body" if body_hit else None
 
+    # Location evidence is searched in scrubbed text, so its offsets are valid for the snippet
+    # (and a city that only appears inside an email address doesn't count).
+    clean = scrub_contact_info(page)
     loc_match, loc_span = None, None
     city = normalize_city(target.city) if target.city else None
     if city:
-        m = re.search(rf"\b{re.escape(city)}\b", re.sub(r"[^a-z0-9 \n]", " ", low))
+        m = re.search(rf"\b{re.escape(city)}\b", re.sub(r"[^a-z0-9 \n]", " ", clean.lower()))
         if m:
             loc_match = "city"
-            cm = re.search(rf"\b{re.escape(target.city)}\b", page, re.I)
+            cm = re.search(rf"\b{re.escape(target.city)}\b", clean, re.I)
             loc_span = (cm.start(), cm.end()) if cm else (m.start(), m.end())
     if loc_match is None:
         state_name = _STATE_NAMES.get(target.state, "")
@@ -206,18 +211,18 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
         if state_name:
             patterns.append((rf"\b{re.escape(state_name)}\b", re.I))
         for pat, flags in patterns:
-            m = re.search(pat, page, flags)
+            m = re.search(pat, clean, flags)
             if m:
                 loc_match, loc_span = "state", (m.start(), m.end())
                 break
 
     evidence = {
-        "page_title": scrub_contact_info(title[:120]),
+        "page_title": scrub_contact_info(title)[:120],
         "name_match": name_match,
         "name_score": round(title_score, 1),
         "name_tokens": distinct,
         "location_match": loc_match,
-        "location_snippet": _snippet(page, *loc_span) if loc_span else None,
+        "location_snippet": _snippet(clean, *loc_span) if loc_span else None,
     }
     if not name_match or not loc_match:
         evidence["rejected"] = "no name evidence" if not name_match else "no city/state evidence"

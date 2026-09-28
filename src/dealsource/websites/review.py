@@ -110,3 +110,68 @@ def write_sample(
     return SampleResult(
         out_path, len(rows), len(picked), dict(sorted(by_conf.items())), excluded=excluded
     )
+
+
+EVIDENCE_COLUMNS = (
+    "confidence",
+    "name_match",
+    "location_match",
+    "page_title",
+    "location_snippet",
+)
+NO_LONGER_FOUND = "(no longer found)"
+
+
+@dataclass
+class RefreshResult:
+    rows: int
+    changed: int
+    no_longer_found: int
+
+
+def refresh_sample(conn: sqlite3.Connection, path: Path) -> RefreshResult:
+    """Rewrite a sample file's evidence columns from the current database, e.g. after stored
+    evidence was re-scrubbed. Rows, their order and every other column (including a filled-in
+    ``correct``) are kept; the file is replaced atomically and stays private (mode 600)."""
+    with path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        header = list(reader.fieldnames or [])
+        rows = list(reader)
+    missing = [c for c in ("company_name", "website", *EVIDENCE_COLUMNS) if c not in header]
+    if missing:
+        raise SampleRefused(f"{path} is not a website sample (missing {', '.join(missing)}).")
+    by_name: dict[tuple[str, str], sqlite3.Row] = {}
+    by_domain: dict[str, list[sqlite3.Row]] = {}
+    for r in found_rows(conn):
+        by_name[(r["domain"], r["canonical_name"])] = r
+        by_domain.setdefault(r["domain"], []).append(r)
+    changed = gone = 0
+    for row in rows:
+        dom = domain_key(row["website"])
+        found = by_name.get((dom, row["company_name"]))
+        if found is None and len(by_domain.get(dom, [])) == 1:
+            found = by_domain[dom][0]
+        if found is None:
+            new = dict.fromkeys(EVIDENCE_COLUMNS, "")
+            new["location_snippet"] = NO_LONGER_FOUND
+            gone += 1
+        else:
+            ev = json.loads(found["evidence_json"] or "{}")
+            new = {
+                "confidence": str(found["confidence"]),
+                "name_match": ev.get("name_match") or "",
+                "location_match": ev.get("location_match") or "",
+                "page_title": ev.get("page_title") or "",
+                "location_snippet": ev.get("location_snippet") or "",
+            }
+        if any(row[c] != new[c] for c in EVIDENCE_COLUMNS):
+            changed += 1
+        row.update(new)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
+    return RefreshResult(len(rows), changed, gone)

@@ -379,7 +379,10 @@ third-party data source, fetching only the companies' own homepages
    | body | state | 0.75 |
 
    Evidence stored: page title, match types, name score, and a short location snippet with
-   contact details scrubbed.
+   contact details scrubbed. The page text is scrubbed **before** the location is searched and
+   the snippet (±40 characters) or title (120) is cut, so a phone number or email split by the
+   cut can't survive as a fragment. A location that appears only inside contact details
+   doesn't count.
 5. **Anything uncertain gets no website:** name without location, location without name, or
    two *different* verified domains (`ambiguous`).
 6. **Resumable:** each company's result (`found`, `not_found`, `too_generic`, `ambiguous`,
@@ -415,6 +418,9 @@ third-party data source, fetching only the companies' own homepages
    that no longer passes loses its `websites` raw record, an `ambiguous` result becomes
    `found` if only one domain still passes, and a result whose replay needs something that
    isn't cached is left as it was and counted. It prints counts only; run `resolve` next.
+   Because it rebuilds the stored evidence, it also re-applies evidence fixes (e.g. snippet
+   scrubbing). `dealsource websites refresh-sample <file>` then rewrites a sample file's
+   evidence columns from the database, keeping its rows and the `correct` column.
 
 **Measured:**
 - **2026-09-27 experiment** (25 Georgia recipients): 28% verified with name-or-title matching
