@@ -259,11 +259,11 @@ def test_weights_are_normalized_and_default():
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"weights": {"sector": 1, "revenue": 1}}, "unknown weight"),
-        ({"weights": {"sector": -1, "size": 2}}, "must not be negative"),
-        ({"weights": {"sector": 0}}, "more than 0"),
-        ({"ownership": {"prefer": ["family_run"]}}, "unknown ownership signal"),
-        ({"shortlist_threshold": 150}, "shortlist_threshold"),
+        ({"weights": {"sector": 1, "revenue": 1}}, "weights: unknown_weight"),
+        ({"weights": {"sector": -1, "size": 2}}, "weights: negative_weight"),
+        ({"weights": {"sector": 0}}, "weights: weights_sum_zero"),
+        ({"ownership": {"prefer": ["family_run"]}}, "ownership.prefer: unknown_ownership_signal"),
+        ({"shortlist_threshold": 150}, "shortlist_threshold: less_than_equal"),
     ],
 )
 def test_invalid_thesis_is_rejected_with_the_field_named(tmp_path, override, message):

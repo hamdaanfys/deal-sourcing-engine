@@ -72,6 +72,8 @@ websites_app = typer.Typer(
 app.add_typer(websites_app, name="websites")
 labels_app = typer.Typer(no_args_is_help=True, help="Analyst labels: the one-time dev/test split.")
 app.add_typer(labels_app, name="labels")
+thesis_app = typer.Typer(no_args_is_help=True, help="Check a thesis file.")
+app.add_typer(thesis_app, name="thesis")
 
 
 def make_http_client() -> httpx.Client:
@@ -1066,3 +1068,19 @@ def eval_cmd(
     for line in result.summary_lines:
         typer.echo(line)
     typer.echo(f"company-level report: {result.report_path}")
+
+
+@thesis_app.command("check")
+def thesis_check(
+    thesis_path: Annotated[Path, typer.Option("--thesis", help="Thesis YAML to validate")],
+) -> None:
+    """Validate a thesis against the scoring rules. Prints PASS, or FAIL with the field and rule
+    name of each problem; never any values from the file. Exit code 0 on pass, 1 on fail."""
+    try:
+        load_thesis(thesis_path)
+    except ThesisError as exc:
+        typer.echo(f"FAIL: {len(exc.problems)} rule(s) broken")
+        for problem in exc.problems:
+            typer.echo(f"  {problem}")
+        raise typer.Exit(1) from exc
+    typer.echo("PASS")

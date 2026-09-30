@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
 from dealsource.resolve.normalize import US_STATES, normalize_state
 
@@ -21,10 +22,19 @@ DEFAULT_WEIGHTS = {"sector": 0.40, "size": 0.20, "geography": 0.20, "ownership":
 OWNERSHIP_SIGNALS = ("founder_led", "family_owned", "pe_or_strategic_backed", "publicly_traded")
 
 
+# Validation problems are reported as (field path, rule name). Rule names are fixed strings and
+# messages never include values from the file, so a problem report can't leak thesis contents.
+
+
+def _rule(name: str, message: str) -> PydanticCustomError:
+    return PydanticCustomError(name, message)
+
+
 def _signals(v: list[str]) -> list[str]:
-    unknown = [s for s in v if s not in OWNERSHIP_SIGNALS]
-    if unknown:
-        raise ValueError(f"unknown ownership signal(s) {unknown}; valid: {list(OWNERSHIP_SIGNALS)}")
+    if any(s not in OWNERSHIP_SIGNALS for s in v):
+        raise _rule(
+            "unknown_ownership_signal", f"valid ownership signals: {', '.join(OWNERSHIP_SIGNALS)}"
+        )
     return v
 
 
@@ -49,7 +59,7 @@ class Sectors(_Strict):
         for code in v:
             code = str(code).strip()
             if not re.fullmatch(r"\d{2,6}", code):
-                raise ValueError(f"NAICS prefix {code!r} must be 2-6 digits")
+                raise _rule("naics_prefix_format", "NAICS prefixes must be 2-6 digits")
             out.append(code)
         return out
 
@@ -71,7 +81,7 @@ class Geography(_Strict):
         for s in v:
             code = normalize_state(str(s))
             if code not in _STATE_CODES:
-                raise ValueError(f"unknown US state {s!r}")
+                raise _rule("unknown_state", "states must be US state codes or names")
             out.append(code)
         return sorted(set(out))
 
@@ -106,14 +116,13 @@ class Thesis(_Strict):
         """Missing weights mean the defaults; given weights are normalized to sum to 1."""
         if not v:
             return dict(DEFAULT_WEIGHTS)
-        unknown = sorted(set(v) - set(WEIGHT_KEYS))
-        if unknown:
-            raise ValueError(f"unknown weight(s) {unknown}; valid: {list(WEIGHT_KEYS)}")
+        if set(v) - set(WEIGHT_KEYS):
+            raise _rule("unknown_weight", f"valid weights: {', '.join(WEIGHT_KEYS)}")
         if any(w < 0 for w in v.values()):
-            raise ValueError("weights must not be negative")
+            raise _rule("negative_weight", "weights must not be negative")
         total = sum(v.values())
         if total <= 0:
-            raise ValueError("weights must add up to more than 0")
+            raise _rule("weights_sum_zero", "weights must add up to more than 0")
         return {k: v.get(k, 0.0) / total for k in WEIGHT_KEYS}
 
     def matches_naics(self, codes: list[str] | str | None) -> bool:
@@ -124,25 +133,49 @@ class Thesis(_Strict):
         return any(c.startswith(p) for c in codes for p in self.sectors.naics_prefixes)
 
 
+_FIELD_NAMES = frozenset(
+    name
+    for model in (Thesis, Sectors, Size, Range, Geography, Ownership, Exclusions)
+    for name in model.model_fields
+)
+_RULE_ALIASES = {"extra_forbidden": "unknown_field"}
+
+
+def problems_from(exc: ValidationError) -> list[str]:
+    """'field.path: rule_name' per problem. Path parts that aren't schema field names (dict keys
+    from the file, unknown fields) show as <key>; list positions show as numbers."""
+    out: list[str] = []
+    for e in exc.errors():
+        parts = [str(p) if isinstance(p, int) or p in _FIELD_NAMES else "<key>" for p in e["loc"]]
+        line = f"{'.'.join(parts) or '(top level)'}: {_RULE_ALIASES.get(e['type'], e['type'])}"
+        if line not in out:
+            out.append(line)
+    return out
+
+
 class ThesisError(ValueError):
-    pass
+    """The message and ``problems`` name fields and rules only, never values from the file."""
+
+    def __init__(self, message: str, problems: list[str] | None = None):
+        super().__init__(message)
+        self.problems = problems or [message]
 
 
 def load_thesis(path: Path) -> tuple[Thesis, str]:
-    """Return (thesis, sha256 of the file). Errors name the field, never echo the file."""
+    """Return (thesis, sha256 of the file). Errors name the field and rule, never echo the file."""
     path = Path(path)
     if not path.exists():
-        raise ThesisError(f"No thesis file at {path}")
+        raise ThesisError(f"No thesis file at {path}", ["(file): not_found"])
     raw = path.read_bytes()
     try:
         data = yaml.safe_load(raw) or {}
     except yaml.YAMLError as exc:
-        raise ThesisError(f"Thesis file is not valid YAML ({type(exc).__name__})") from exc
+        raise ThesisError(
+            f"Thesis file is not valid YAML ({type(exc).__name__})", ["(file): invalid_yaml"]
+        ) from exc
     try:
         thesis = Thesis.model_validate(data)
     except ValidationError as exc:
-        problems = "; ".join(
-            f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
-        )
-        raise ThesisError(f"Invalid thesis: {problems}") from exc
+        problems = problems_from(exc)
+        raise ThesisError(f"Invalid thesis: {'; '.join(problems)}", problems) from exc
     return thesis, hashlib.sha256(raw).hexdigest()

@@ -881,7 +881,11 @@ run (`scores.run_id`) and prints counts only. The rules, with the constants in `
 - **Thesis checks:** `weights` may only name sector, size, geography and ownership, none
   negative, sum above 0. They are normalized to sum to 1; with none given the defaults are
   0.4/0.2/0.2/0.2. `ownership.prefer` and `exclusions.ownership` must name real ownership
-  signals, and `shortlist_threshold` is 0–100.
+  signals, and `shortlist_threshold` is 0–100. Every problem is reported as `field.path:
+  rule_name` (e.g. `ownership.prefer: unknown_ownership_signal`), never with values from the
+  file; dictionary keys and unknown fields from the file show as `<key>`.
+  `dealsource thesis check --thesis PATH` prints only `PASS`, or `FAIL` and those lines (exit
+  code 0 or 1). Commands that load a thesis report errors the same way.
 - **Text searched:** the extraction's product lines, end markets, summary and evidence quotes
   (all already scrubbed and masked). Phrases match as whole words, case-insensitive, and a
   plural of the last word counts ("medical devices" for "medical device"). The full page text
@@ -1163,6 +1167,7 @@ dealsource ingest csv PATH [--map ...] [--source-name NAME] [--revenue-unit usd_
 dealsource ingest cbp --naics 3323,3327 --geo state:13,37 --year 2022
 dealsource resolve [--review]
 dealsource enrich [--limit N] [--company-id ID] [--refresh-older-than 30d] [--remask]
+dealsource thesis check --thesis PATH                      # PASS, or FAIL + field: rule names only
 dealsource score --thesis PATH                             # counts only
 dealsource export --thesis PATH [--out PATH]
 dealsource run --thesis PATH [--input CSV ...]
@@ -1265,3 +1270,4 @@ component (after v1).
 | 2026-09-29 | Phase 4 and 5 implemented (score, ranked export, eval), tested on synthetic data only. Scoring rules as in §9.4: sector 0.6 for a thesis NAICS code plus up to 0.4 for keyword/end-market hits (2 hits for full marks); confidence = components resting on evidence (4 high, 3 medium, ≤2 low); every company is scored. |
 | 2026-09-29 | Eval: unmatched labels are left out of the ranking metrics, their count is printed prominently, and `eval` refuses when more than 5% of the split's labeled companies are unmatched (§11.5). |
 | 2026-09-29 | No `labels` table: each `eval` reads only its own split's labels from the files, so dev evaluations never copy test labels into the DB (§5). |
+| 2026-09-29 | Thesis validation problems are named by field path and a fixed rule name, never by the values in the file (the NAICS, state and new scoring checks used to repeat the bad value). `dealsource thesis check` validates a thesis and prints only PASS/FAIL and those names (§9.4). |
