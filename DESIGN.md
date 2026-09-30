@@ -1,7 +1,10 @@
 # Deal-Sourcing Engine: Design
 
-Status: **approved design (rev 3)**. Nothing here is implemented yet. Decisions made during
-review are listed in §17.
+Status: **approved design (rev 3), partly implemented.** Built: ingest (CSV, Census CBP),
+discovery (SAM.gov, USAspending, OpenStreetMap), the website finder (§6.4), resolve, enrich,
+`labels export` and `labels split`. Not built yet: score (§9), the ranked CSV export (§10),
+eval metrics (§11.5–11.6), `labels status` and `enrich --remask`. Decisions made during review
+and implementation are listed in §17.
 
 ## 1. Purpose
 
@@ -356,6 +359,10 @@ third-party data source, fetching only the companies' own homepages
    - **Name**, strongest first:
      - *exact title*: a title or `og:site_name` segment has the same normalized name
        (`name_key`: legal suffixes dropped, abbreviations expanded, plurals singularized).
+       `name_key` also drops a trailing "group" or "holding(s)", but those aren't legal forms
+       ("Acme Group, Inc." and "Acme Corporation" are often a parent and a subsidiary), so the
+       segment must also have the same group/holding words as the name. A segment that matches
+       only once they are dropped counts as *fuzzy title*. `resolve` is unaffected.
      - *fuzzy title*: a segment scores 93–99 against the name. A close but different name
        may be another company, so it is accepted **only with the city**; the state is not
        enough, and with no city on record it is never enough. Body words can't overrule a
@@ -1196,3 +1203,7 @@ component (after v1).
 | 2026-09-28 | Website finder: a domain is accepted only with name AND city/state evidence; confidence and evidence are stored; uncertain → no website. Resumable with progress counts. A 30-company hand-check sample comes before labeling. |
 | 2026-09-28 | Staffing agencies are excluded (firm decision); the thesis lists the usual wordings. |
 | 2026-09-28 | Website finder: `--workers N` (default 8) checks companies in parallel with one request at a time per site (shared `SiteGate`, lock per registrable domain), so no site gets more traffic than sequentially. `--limit N` takes the next N unchecked companies in a seeded order spread across states in proportion; reruns continue with the rest (§6.4). |
+| 2026-09-28 | Website finder name rule tightened after the first hand-check: a title close to the name but not the same normalized name (`title_fuzzy`, 93–99) is accepted only with the city, and body words can't overrule it. Body name words must match whole words (plurals count, prefixes don't) (§6.4). |
+| 2026-09-28 | `dealsource websites recheck` re-verifies found and ambiguous results with the current rules from the cache only (no requests). A website that no longer passes loses its `websites` raw record; `resolve` runs next. `websites sample --exclude` leaves out already-checked companies (§6.4). |
+| 2026-09-28 | Website evidence is scrubbed before it is cut: the page text is scrubbed first and the location is searched in the scrubbed text, so a phone number or email split by the snippet cut can't survive as a fragment. `websites refresh-sample` rewrites a sample file's evidence from the DB (§6.4). |
+| 2026-09-29 | Website finder: an exact title must also have the same trailing group/holding words as the company name; a title that matches only once they are dropped is a fuzzy title and needs the city. `resolve`'s `name_key` is unchanged. This fix came **after** the first hand-check sample was measured (it was prompted by that sample's one name problem), so that sample's accuracy doesn't measure it; the next sample should use `--exclude`. The offline recheck removed 2 of 186 found websites (both state-only), and `labels export` was re-run (§6.4). |

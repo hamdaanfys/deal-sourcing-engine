@@ -91,6 +91,10 @@ CONFIDENCE = {
 }
 TITLE_MATCH = 93.0
 EXACT_TITLE = 100.0
+# name_key drops these with the legal suffixes, but they aren't legal forms: "Acme Group, Inc."
+# and "Acme Corporation" are often a parent and a subsidiary. A title that matches only once
+# they are dropped counts as close, not exact.
+ENTITY_WORDS = frozenset({"group", "holding", "holdings"})
 
 FOUND, NOT_FOUND, TOO_GENERIC, AMBIGUOUS, ERROR = (
     "found",
@@ -157,6 +161,15 @@ def _site_names(html: str, title: str) -> list[str]:
     return names
 
 
+def _entity_words(name: str) -> set[str]:
+    """The group/holding words in the name's trailing run of legal suffixes, which name_key drops."""
+    toks = name_tokens(name)
+    trailing: set[str] = set()
+    while toks and toks[-1] in LEGAL_SUFFIXES:
+        trailing.add(toks.pop())
+    return {"holding" if t == "holdings" else t for t in trailing & ENTITY_WORDS}
+
+
 def _snippet(clean: str, start: int, end: int) -> str:
     """Up to 40 characters either side of the match. ``clean`` must already be scrubbed:
     scrubbing after the cut would miss a phone number or email split by it."""
@@ -175,9 +188,11 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
         return 0.0, {"rejected": "parked domain"}
 
     key = name_key(target.name)
-    title_score = max(
-        (name_similarity(key, name_key(n)) for n in _site_names(html, title)), default=0.0
-    )
+    entity = _entity_words(target.name)
+    scored = [(name_similarity(key, name_key(n)), n) for n in _site_names(html, title)]
+    title_score = max((s for s, _ in scored), default=0.0)
+    # Exact only with the same group/holding words too: "Acme Group" isn't "Acme Corporation".
+    exact_title = any(s >= EXACT_TITLE and _entity_words(n) == entity for s, n in scored)
     distinct = [t for t in key.split() if t not in GENERIC_WORDS and len(t) >= 3]
     # Whole words only, plurals included: "tools" counts for "tool", "precision" not for "precise".
     body_hit = (
@@ -186,7 +201,7 @@ def verify_page(html: str, target: Target) -> tuple[float, dict]:
         and set(distinct) <= word_keys(page)
     )
     # A close-but-not-exact title may name a different company, so body words can't overrule it.
-    if title_score >= EXACT_TITLE:
+    if exact_title:
         name_match = "title"
     elif title_score >= TITLE_MATCH:
         name_match = "title_fuzzy"

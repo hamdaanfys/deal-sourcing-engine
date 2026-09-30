@@ -17,7 +17,7 @@ from dealsource.clock import SystemClock
 from dealsource.enrich.fetcher import PoliteFetcher, SiteGate, is_cacheable_page
 from dealsource.httpcache import CachedHttp
 from dealsource.models import RawCompanyRecord
-from dealsource.resolve.normalize import domain_key
+from dealsource.resolve.normalize import domain_key, name_key
 from dealsource.resolve.pipeline import resolve
 from dealsource.score.thesis import load_thesis
 from dealsource.sources.csv_source import store_records
@@ -165,6 +165,44 @@ def test_exact_normalized_title_accepts_suffix_plural_and_abbreviation_changes()
     html = GOOD.replace("Acme Precision Machining |", "ACME Precision Machinings, Inc. |")
     conf, ev = wf.verify_page(html, target())
     assert (conf, ev["name_match"], ev["name_score"]) == (0.95, "title", 100.0)
+
+
+def titled_page(title, footer="Warner Robins, GA 31088"):
+    return f"<html><head><title>{title}</title></head><body><footer>{footer}</footer></body></html>"
+
+
+def test_title_matching_only_without_group_is_close_not_exact():
+    # A parent group and a similarly named subsidiary: name_key makes them equal, but the
+    # finder doesn't treat a dropped "Group" as the same name, so the state isn't enough.
+    assert name_key("KESTRELINE GROUP, INC.") == name_key("Kestreline Corp")
+    group = target(name="KESTRELINE GROUP, INC.", city=None)
+    conf, ev = wf.verify_page(titled_page("Kestreline Corporation"), group)
+    assert (ev["name_match"], ev["name_score"], ev["location_match"]) == (
+        "title_fuzzy",
+        100.0,
+        "state",
+    )
+    assert conf == 0.0 and ev["rejected"] == "fuzzy title needs city"
+    # With the city on the page it passes as a close title; the reverse direction is close too.
+    with_city = target(name="KESTRELINE GROUP, INC.", city="Warner Robins")
+    assert wf.verify_page(titled_page("Kestreline Corporation"), with_city)[0] == 0.85
+    plain = target(name="KESTRELINE LLC", city=None)
+    assert (
+        wf.verify_page(titled_page("Kestreline Holdings"), plain)[1]["name_match"] == "title_fuzzy"
+    )
+
+
+@pytest.mark.parametrize(
+    ("company", "title"),
+    [
+        ("KESTRELINE GROUP, INC.", "Kestreline Group | Home"),
+        ("KESTRELINE HOLDING CO", "Kestreline Holdings, LLC"),
+        ("KESTRELINE CORP", "Kestreline, Inc."),  # legal forms still match each other
+    ],
+)
+def test_same_group_or_holding_words_still_match_exactly(company, title):
+    conf, ev = wf.verify_page(titled_page(title), target(name=company, city=None))
+    assert (conf, ev["name_match"]) == (0.90, "title")
 
 
 def body_page(words):
