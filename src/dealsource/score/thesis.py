@@ -1,7 +1,7 @@
 """Investment thesis YAML (DESIGN.md §9.1): validated with clear errors, hashed for traceability.
 
-Discovery and the labeling export use the sector (NAICS) and geography parts now; scoring uses
-the rest later.
+Discovery and the labeling export use the sector (NAICS) and geography parts; scoring uses all
+of it.
 """
 
 from __future__ import annotations
@@ -16,6 +16,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from dealsource.resolve.normalize import US_STATES, normalize_state
 
 _STATE_CODES = set(US_STATES.values())
+WEIGHT_KEYS = ("sector", "size", "geography", "ownership")
+DEFAULT_WEIGHTS = {"sector": 0.40, "size": 0.20, "geography": 0.20, "ownership": 0.20}
+OWNERSHIP_SIGNALS = ("founder_led", "family_owned", "pe_or_strategic_backed", "publicly_traded")
+
+
+def _signals(v: list[str]) -> list[str]:
+    unknown = [s for s in v if s not in OWNERSHIP_SIGNALS]
+    if unknown:
+        raise ValueError(f"unknown ownership signal(s) {unknown}; valid: {list(OWNERSHIP_SIGNALS)}")
+    return v
 
 
 class _Strict(BaseModel):
@@ -69,11 +79,15 @@ class Geography(_Strict):
 class Ownership(_Strict):
     prefer: list[str] = Field(default_factory=list)
 
+    _check_prefer = field_validator("prefer")(_signals)
+
 
 class Exclusions(_Strict):
     keywords: list[str] = Field(default_factory=list)
     ownership: list[str] = Field(default_factory=list)
     domains: list[str] = Field(default_factory=list)
+
+    _check_ownership = field_validator("ownership")(_signals)
 
 
 class Thesis(_Strict):
@@ -84,7 +98,23 @@ class Thesis(_Strict):
     ownership: Ownership = Field(default_factory=Ownership)
     exclusions: Exclusions = Field(default_factory=Exclusions)
     weights: dict[str, float] = Field(default_factory=dict)
-    shortlist_threshold: float = 60
+    shortlist_threshold: float = Field(60, ge=0, le=100)
+
+    @field_validator("weights")
+    @classmethod
+    def _weights(cls, v: dict[str, float]) -> dict[str, float]:
+        """Missing weights mean the defaults; given weights are normalized to sum to 1."""
+        if not v:
+            return dict(DEFAULT_WEIGHTS)
+        unknown = sorted(set(v) - set(WEIGHT_KEYS))
+        if unknown:
+            raise ValueError(f"unknown weight(s) {unknown}; valid: {list(WEIGHT_KEYS)}")
+        if any(w < 0 for w in v.values()):
+            raise ValueError("weights must not be negative")
+        total = sum(v.values())
+        if total <= 0:
+            raise ValueError("weights must add up to more than 0")
+        return {k: v.get(k, 0.0) / total for k in WEIGHT_KEYS}
 
     def matches_naics(self, codes: list[str] | str | None) -> bool:
         if not codes:

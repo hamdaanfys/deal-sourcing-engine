@@ -153,6 +153,35 @@ MIGRATIONS: list[str] = [
         finished_at TEXT NOT NULL
     );
     """,
+    # 5: scoring (one row per company per score run) and evaluation runs (aggregate metrics only)
+    """
+    CREATE TABLE scores (
+        run_id TEXT NOT NULL,
+        company_id INTEGER NOT NULL,
+        thesis_hash TEXT NOT NULL,
+        total REAL NOT NULL,
+        components_json TEXT NOT NULL,
+        excluded INTEGER NOT NULL,
+        exclusion_rule TEXT,
+        reason TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        scored_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, company_id)
+    );
+    CREATE INDEX idx_scores_thesis ON scores(thesis_hash, scored_at);
+
+    CREATE TABLE eval_runs (
+        eval_id TEXT PRIMARY KEY,
+        split TEXT NOT NULL,
+        thesis_hash TEXT NOT NULL,
+        score_run_id TEXT NOT NULL,
+        code_version TEXT,
+        bootstrap_seed INTEGER NOT NULL,
+        metrics_json TEXT NOT NULL,
+        report_path TEXT,
+        created_at TEXT NOT NULL
+    );
+    """,
 ]
 
 

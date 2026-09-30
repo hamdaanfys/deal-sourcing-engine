@@ -6,7 +6,9 @@ Prints aggregate counts only; record-level output goes to files under the data d
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
+import subprocess
 from datetime import date
 from pathlib import Path
 from typing import Annotated
@@ -22,20 +24,26 @@ from dealsource.enrich.fetcher import PoliteFetcher, SiteGate, is_cacheable_page
 from dealsource.enrich.pipeline import EnrichConfig
 from dealsource.enrich.pipeline import enrich as run_enrich
 from dealsource.enrich.prompts import PROMPT_VERSION
+from dealsource.eval.evaluate import EvalRefused, append_test_log, evaluate, read_test_log
 from dealsource.eval.label_export import DEFAULT_N, ExportRefused, export_for_labeling
 from dealsource.eval.labels import LabelsError
+from dealsource.eval.metrics import DEFAULT_BOOTSTRAP_SEED
 from dealsource.eval.split import (
     DEFAULT_SEED,
     DEFAULT_TEST_FRACTION,
+    TEST,
     SplitRefused,
     format_counts,
     make_split,
 )
+from dealsource.export.csv_export import ExportRefused as RankedExportRefused
+from dealsource.export.csv_export import export_ranked
 from dealsource.httpcache import CachedHttp
 from dealsource.llm.cache import LLMRunner
 from dealsource.llm.ollama import OllamaBackend, RemoteHostRefused
 from dealsource.models import GeoSpec
 from dealsource.resolve.pipeline import resolve as run_resolve
+from dealsource.score.scorer import latest_score_run, score_all
 from dealsource.score.thesis import Thesis, ThesisError, load_thesis
 from dealsource.sources.census_cbp import CensusCBPSource, CensusError, store_stats
 from dealsource.sources.csv_source import ContactColumnError, CSVSource, store_records
@@ -103,6 +111,22 @@ def require_contact(settings: Settings) -> None:
 
 def make_today() -> date:
     return date.today()
+
+
+def make_code_version() -> str | None:
+    """The git commit of this code, recorded with every evaluation; None outside a checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
 
 
 def get_thesis(path: Path) -> tuple[Thesis, str]:
@@ -914,3 +938,131 @@ def websites_sample(
         "  by confidence: " + ", ".join(f"{k}: {v}" for k, v in result.by_confidence.items())
     )
     typer.echo("  Fill in the 'correct' column (y/n) to measure precision before labeling.")
+
+
+@app.command()
+def score(
+    ctx: typer.Context,
+    thesis_path: Annotated[Path, typer.Option("--thesis", help="Thesis YAML")],
+) -> None:
+    """Score every company against the thesis (deterministic rules; never reads labels)."""
+    settings: Settings = ctx.obj
+    require_split(settings)
+    thesis, thesis_hash = get_thesis(thesis_path)
+    conn = open_db(settings)
+    with db.record_run(conn, "score", {"thesis_sha256": thesis_hash}) as stats:
+        result = score_all(conn, thesis, thesis_hash)
+        stats.update(vars(result))
+    typer.echo(
+        f"Scored {result.scored:,} companies: {result.shortlisted:,} at or above the shortlist "
+        f"threshold ({thesis.shortlist_threshold:g}), {result.excluded:,} excluded"
+    )
+    typer.echo("  confidence: " + ", ".join(f"{k} {v:,}" for k, v in result.confidence.items()))
+    if result.exclusions:
+        typer.echo("  exclusions: " + ", ".join(f"{k} {v:,}" for k, v in result.exclusions.items()))
+
+
+@app.command("export")
+def export_cmd(
+    ctx: typer.Context,
+    thesis_path: Annotated[Path, typer.Option("--thesis", help="Thesis YAML (as scored)")],
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Output CSV (default: <data dir>/exports/<thesis>_<date>_<run>.csv)"),
+    ] = None,
+) -> None:
+    """Write the ranked, explained CSV of the latest score run for this thesis (counts only here)."""
+    settings: Settings = ctx.obj
+    require_split(settings)
+    thesis, thesis_hash = get_thesis(thesis_path)
+    conn = open_db(settings)
+    with db.record_run(conn, "export", {"thesis_sha256": thesis_hash}) as stats:
+        if out is None:
+            run = latest_score_run(conn, thesis_hash) or "none"
+            slug = re.sub(r"[^a-z0-9]+", "-", thesis_path.stem.lower()).strip("-") or "thesis"
+            out = settings.exports_dir / f"{slug}_{make_today().isoformat()}_{run[:8]}.csv"
+        try:
+            result = export_ranked(conn, thesis, thesis_hash, out_path=out)
+        except RankedExportRefused as exc:
+            stats["error"] = str(exc)
+            typer.echo(f"Refusing to export: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        stats.update(rows=result.rows, excluded=result.excluded, market_rows=result.market_rows)
+    typer.echo(
+        f"Wrote {result.rows:,} companies to {result.path} ({result.shortlisted:,} shortlisted, "
+        f"{result.excluded:,} excluded at the bottom)"
+    )
+    if result.market_path:
+        typer.echo(f"  market stats: {result.market_rows:,} rows in {result.market_path}")
+    else:
+        typer.echo("  market stats: none for the thesis sectors and states (run `ingest cbp`)")
+
+
+@app.command("eval")
+def eval_cmd(
+    ctx: typer.Context,
+    thesis_path: Annotated[Path, typer.Option("--thesis", help="Thesis YAML (as scored)")],
+    set_: Annotated[
+        str, typer.Option("--set", help="dev (default, for tuning) or test (once, needs --final)")
+    ] = "dev",
+    final: Annotated[
+        bool, typer.Option(help="Required with --set test: the one-time held-out evaluation")
+    ] = False,
+    bootstrap_seed: Annotated[
+        int, typer.Option(help="Seed for the bootstrap intervals")
+    ] = DEFAULT_BOOTSTRAP_SEED,
+) -> None:
+    """Evaluate the latest score run against the labels. Aggregate metrics only; company-level
+    detail goes to a file under <data dir>/evals/."""
+    settings: Settings = ctx.obj
+    require_split(settings)
+    if set_ not in ("dev", TEST):
+        raise typer.BadParameter("--set must be dev or test")
+    if final and set_ != TEST:
+        raise typer.BadParameter("--final only applies to --set test")
+    if set_ == TEST and not final:
+        typer.echo(
+            "Refusing: the held-out test set is evaluated once, at the end. Tune on the dev set; "
+            "when you are done, run `dealsource eval --set test --final`.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    if set_ == TEST:
+        # Checked before any test label is read.
+        logged = read_test_log(settings.test_eval_log_path)
+        if logged:
+            typer.echo(
+                f"Refusing: the test set was already evaluated ({logged[0]['created_at']}); it runs "
+                "once. The recorded metrics:",
+                err=True,
+            )
+            for line in logged[0]["summary_lines"]:
+                typer.echo(f"  {line}")
+            raise typer.Exit(1)
+    thesis, thesis_hash = get_thesis(thesis_path)
+    conn = open_db(settings)
+    code_version = make_code_version()
+    params = {"thesis_sha256": thesis_hash, "set": set_, "bootstrap_seed": bootstrap_seed}
+    with db.record_run(conn, "eval", params) as stats:
+        try:
+            result = evaluate(
+                conn,
+                thesis,
+                thesis_hash,
+                split=set_,
+                labels_path=settings.labels_path,
+                manifest_path=settings.split_manifest_path,
+                evals_dir=settings.evals_dir,
+                code_version=code_version,
+                bootstrap_seed=bootstrap_seed,
+            )
+        except (EvalRefused, LabelsError) as exc:
+            stats["error"] = str(exc)
+            typer.echo(f"Refusing to evaluate: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        stats.update(eval_id=result.eval_id, matched=result.matched, unmatched=result.unmatched)
+        if set_ == TEST:
+            append_test_log(settings.test_eval_log_path, result, thesis_hash, code_version)
+    for line in result.summary_lines:
+        typer.echo(line)
+    typer.echo(f"company-level report: {result.report_path}")

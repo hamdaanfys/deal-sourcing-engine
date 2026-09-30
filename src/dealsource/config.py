@@ -84,6 +84,18 @@ class Settings:
     def review_dir(self) -> Path:
         return self.data_dir / "review"
 
+    @property
+    def exports_dir(self) -> Path:
+        return self.data_dir / "exports"
+
+    @property
+    def evals_dir(self) -> Path:
+        return self.data_dir / "evals"
+
+    @property
+    def test_eval_log_path(self) -> Path:
+        return self.evals_dir / "test_eval_log.jsonl"
+
     def ensure_data_dir(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 

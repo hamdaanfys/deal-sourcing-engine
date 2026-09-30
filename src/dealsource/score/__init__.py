@@ -1,1 +1,1 @@
-"""Thesis definition and (later) scoring."""
+"""Thesis definition and deterministic scoring."""

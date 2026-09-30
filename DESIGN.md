@@ -2,9 +2,10 @@
 
 Status: **approved design (rev 3), partly implemented.** Built: ingest (CSV, Census CBP),
 discovery (SAM.gov, USAspending, OpenStreetMap), the website finder (§6.4), resolve, enrich,
-`labels export` and `labels split`. Not built yet: score (§9), the ranked CSV export (§10),
-eval metrics (§11.5–11.6), `labels status` and `enrich --remask`. Decisions made during review
-and implementation are listed in §17.
+`labels export`, `labels split`, score (§9), the ranked CSV export (§10) and eval (§11.4–11.6).
+Score, export and eval are tested on synthetic data only and haven't been run on real data yet.
+Not built yet: `dealsource run`, `labels status` and `enrich --remask`. Decisions made during
+review and implementation are listed in §17.
 
 ## 1. Purpose
 
@@ -98,9 +99,10 @@ deal-sourcing-engine/
 │   │   └── scorer.py             # component scores, exclusions, written reasons
 │   ├── eval/
 │   │   ├── label_export.py       # sample candidates to private/to_label.csv for labeling
+│   │   ├── evaluate.py           # match labels to scores, one split, report file, test-once log
 │   │   ├── labels.py             # load + validate labels.csv, match labels to companies
 │   │   ├── split.py              # one-time grouped, stratified dev/test split + manifest
-│   │   └── metrics.py            # aggregate metrics; company-level report writer
+│   │   └── metrics.py            # aggregate metrics, Wilson and bootstrap intervals
 │   └── export/
 │       └── csv_export.py
 ├── tests/
@@ -179,9 +181,12 @@ One file, WAL mode, schema managed by numbered SQL migrations in `db.py`
 | `llm_cache` | `cache_key` (PK), `backend`, `model`, `prompt_version`, `schema_hash`, `response_json`, `created_at`. |
 | `llm_calls` | One row per LLM request, including cache hits: `company_id`, `stage`, `model`, `prompt_tokens`, `completion_tokens`, `latency_ms`, `cache_hit`, `ok`, `error`, `created_at`. |
 | `enrichments` | Latest structured extraction per company (after masking): `company_id`, `extraction_json`, `pages_used_json`, `llm_cache_key`, `mask_version`, `status`, `updated_at`. |
-| `scores` | `run_id`, `company_id`, `thesis_hash`, `total`, `components_json`, `excluded`, `reason`, `confidence`. |
-| `labels` | A working copy of the labels, loaded from `private/labels.csv` and `private/labels_split.json`: `label_key`, `decision`, `split` (`dev`/`test`), `matched_company_id`, `match_method`. Rebuilt from the files on every `eval`. The files are the source of truth, never this table. |
-| `eval_runs` | `eval_id`, `split`, `thesis_hash`, `code_version` (git commit), `metrics_json`, `report_path`, `created_at`. |
+| `scores` | One row per company per score run: `run_id`, `company_id`, `thesis_hash`, `total`, `components_json` (components, which ones rest on evidence, employees and facilities used), `excluded`, `exclusion_rule`, `reason`, `confidence`, `scored_at`. |
+| `eval_runs` | `eval_id`, `split`, `thesis_hash`, `score_run_id`, `code_version` (git commit), `bootstrap_seed`, `metrics_json` (aggregates only), `report_path`, `created_at`. |
+
+There is no `labels` table (a change from rev 3): rebuilding it on each `eval` would copy
+test-split labels into the DB during dev evaluations. Each `eval` reads only its own split's
+rows from `private/labels.csv` and `private/labels_split.json`.
 | `runs` | `run_id`, `stage`, `started_at`, `finished_at`, `params_json`, `stats_json`. |
 
 Since the DB holds cached page bodies, company data, labels and scores, it is confidential and
@@ -868,6 +873,39 @@ The size component uses signals in this order of precedence:
 The LLM never estimates revenue, and employee counts are never converted into revenue
 estimates.
 
+### 9.4 Implementation notes (Phase 4)
+
+`score/scorer.py`; `dealsource score --thesis PATH` scores **every** company as one new score
+run (`scores.run_id`) and prints counts only. The rules, with the constants in `scorer.py`:
+
+- **Thesis checks:** `weights` may only name sector, size, geography and ownership, none
+  negative, sum above 0. They are normalized to sum to 1; with none given the defaults are
+  0.4/0.2/0.2/0.2. `ownership.prefer` and `exclusions.ownership` must name real ownership
+  signals, and `shortlist_threshold` is 0–100.
+- **Text searched:** the extraction's product lines, end markets, summary and evidence quotes
+  (all already scrubbed and masked). Phrases match as whole words, case-insensitive, and a
+  plural of the last word counts ("medical devices" for "medical device"). The full page text
+  isn't stored, so a keyword the model didn't mention isn't seen.
+- **Sector:** 0.6 if a NAICS code is under a thesis prefix, plus
+  `0.4 × min(1, distinct keyword/end-market hits / 2)`.
+- **Size** (§9.3): the employee count from source records (e.g. CSV), else the site's count
+  with its quote; else facility count capped at 0.8; revenue fit averaged in when a CSV
+  supplied it (or used alone without another signal); no signal = 0.5. The square-footage
+  tiebreak isn't used.
+- **Geography:** thesis state 1, unknown state 0.5, other state in an allowed country 0.25, a
+  country outside the thesis 0.
+- **Ownership:** any preferred signal "yes" = 1, all "no" = 0.25, otherwise (or no `prefer`
+  list) 0.5.
+- **Exclusions**, first match wins: `exclusions.domains` (normalized), an excluded ownership
+  signal equal to "yes", then a keyword in the text above or the company name. The rule name
+  (`domain`, `ownership:<signal>`, `keyword:<keyword>`) is stored and the reason cites the
+  evidence quote and page when there is one.
+- **Confidence:** the number of components resting on evidence (sector: NAICS or text hit;
+  size: any signal; geography: known state or country; ownership: a preferred signal not
+  "unknown"): 4 = high, 3 = medium, 2 or fewer = low.
+- **Companies without a successful enrichment** are scored on NAICS and state, and the reason
+  says "Website not analyzed yet." or gives the enrichment status.
+
 ## 10. Stage 5: Export
 
 `dealsource export --thesis private/theses/x.yaml --out private/exports/…csv`
@@ -879,6 +917,15 @@ sources, company_id, scored_at, thesis_name`. List fields are joined with `; `. 
 with a BOM, so it opens cleanly in Excel. The export also writes a small `*.market.csv`
 sidecar with CBP stats for the thesis sectors and geographies. The export never contains
 label or split information.
+
+Implementation (`export/csv_export.py`): the export reads the latest score run for the
+thesis file's hash and refuses if there is none. Rows are ordered by score, then confidence,
+then company ID. Excluded companies come last with an empty `rank`. `employees` and
+`employees_source` are the values the scorer used. `--out` defaults to
+`<data dir>/exports/<thesis file>_<date>_<score run>.csv`, and files are never overwritten.
+The market file holds US rows plus state and county rows in thesis states, for NAICS codes
+under a thesis prefix (CBP codes are compared without trailing zeros, so `332300` counts for
+`3323`). It's only written when there are such rows. The terminal shows counts only.
 
 ## 11. Evaluation against analyst labels
 
@@ -1035,8 +1082,16 @@ reported, not treated as an error, because appending labels is expected. A key w
 
 ### 11.5 Metrics and outputs
 
-Labels are matched to scored companies with the §7 matcher (domain first, then name + state).
-Unmatched labels count against coverage; they are not dropped silently.
+Labels are matched to the companies of the latest score run for the thesis: by domain first,
+then by name similarity ≥ 93 (the §7 threshold) among companies in the label's state. A label
+without a state, or with two equally good name matches, stays unmatched.
+
+**Unmatched labels are left out of every ranking metric** (they'd otherwise mix resolution
+problems into ranking quality). The summary prints their count prominently, split into
+pursue and pass. **If more than 5% of the split's labeled companies are unmatched, `eval`
+refuses** (exit code 1): no metrics are computed, and the unmatched labels go to
+`private/evals/unmatched_<split>.csv` for the analyst. A refused test-set evaluation doesn't
+count as the one run.
 
 **Terminal (aggregate only, with no company names, domains or per-row values):**
 - the split, n labels, n matched (coverage %), pursue/pass balance
@@ -1108,10 +1163,10 @@ dealsource ingest csv PATH [--map ...] [--source-name NAME] [--revenue-unit usd_
 dealsource ingest cbp --naics 3323,3327 --geo state:13,37 --year 2022
 dealsource resolve [--review]
 dealsource enrich [--limit N] [--company-id ID] [--refresh-older-than 30d] [--remask]
-dealsource score --thesis PATH
-dealsource export --thesis PATH --out PATH
+dealsource score --thesis PATH                             # counts only
+dealsource export --thesis PATH [--out PATH]
 dealsource run --thesis PATH [--input CSV ...]
-dealsource eval --thesis PATH [--set dev]                  # aggregate to terminal, detail to private/evals/
+dealsource eval --thesis PATH [--set dev] [--bootstrap-seed N]   # aggregate to terminal, detail to private/evals/
 dealsource eval --thesis PATH --set test --final           # once
 dealsource stats                                           # LLM latency/tokens, cache hit rates, stage counts
 ```
@@ -1207,3 +1262,6 @@ component (after v1).
 | 2026-09-28 | `dealsource websites recheck` re-verifies found and ambiguous results with the current rules from the cache only (no requests). A website that no longer passes loses its `websites` raw record; `resolve` runs next. `websites sample --exclude` leaves out already-checked companies (§6.4). |
 | 2026-09-28 | Website evidence is scrubbed before it is cut: the page text is scrubbed first and the location is searched in the scrubbed text, so a phone number or email split by the snippet cut can't survive as a fragment. `websites refresh-sample` rewrites a sample file's evidence from the DB (§6.4). |
 | 2026-09-29 | Website finder: an exact title must also have the same trailing group/holding words as the company name; a title that matches only once they are dropped is a fuzzy title and needs the city. `resolve`'s `name_key` is unchanged. This fix came **after** the first hand-check sample was measured (it was prompted by that sample's one name problem), so that sample's accuracy doesn't measure it; the next sample should use `--exclude`. The offline recheck removed 2 of 186 found websites (both state-only), and `labels export` was re-run (§6.4). |
+| 2026-09-29 | Phase 4 and 5 implemented (score, ranked export, eval), tested on synthetic data only. Scoring rules as in §9.4: sector 0.6 for a thesis NAICS code plus up to 0.4 for keyword/end-market hits (2 hits for full marks); confidence = components resting on evidence (4 high, 3 medium, ≤2 low); every company is scored. |
+| 2026-09-29 | Eval: unmatched labels are left out of the ranking metrics, their count is printed prominently, and `eval` refuses when more than 5% of the split's labeled companies are unmatched (§11.5). |
+| 2026-09-29 | No `labels` table: each `eval` reads only its own split's labels from the files, so dev evaluations never copy test labels into the DB (§5). |
