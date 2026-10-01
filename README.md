@@ -1,5 +1,9 @@
 # dealsource
 
+[![CI](https://github.com/hamdaanfys/deal-sourcing-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/hamdaanfys/deal-sourcing-engine/actions/workflows/ci.yml)
+
+**Status:** pipeline built and tested; labeling and evaluation in progress.
+
 Turns an investment thesis into a ranked, explained list of acquisition targets. It runs
 entirely on one machine: SQLite storage and local LLM inference (Ollama). See `DESIGN.md`
 for the architecture and `CLAUDE.md` for the working rules.
@@ -36,7 +40,7 @@ dealsource resolve
 dealsource websites sample          # 30 matches -> private/review/website_sample.csv to hand-check
 
 # 2. Label a sample (only company_name, website, state, decision; nothing the tool inferred)
-dealsource labels export --thesis private/theses/my-thesis.yaml     # -> private/to_label.csv
+dealsource labels export --thesis private/theses/thesis.yaml        # -> private/to_label.csv
 #    fill in decision (pursue/pass), save as private/labels.csv, then, once:
 dealsource labels split
 
