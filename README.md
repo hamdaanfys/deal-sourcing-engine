@@ -45,9 +45,15 @@ dealsource labels export --thesis private/theses/thesis.yaml        # -> private
 dealsource labels split
 
 # 3. After the split
-dealsource enrich
-dealsource stats
+dealsource thesis check --thesis private/theses/thesis.yaml   # validate the thesis: PASS, or FAIL with field/rule names only (runs any time)
+dealsource enrich                                             # fetch each company's site politely and extract facts with the local LLM
+dealsource score --thesis private/theses/thesis.yaml          # deterministic, rule-based score and written reason for every company
+dealsource export --thesis private/theses/thesis.yaml         # ranked, explained CSV -> private/exports/ (plus CBP market stats)
+dealsource eval --thesis private/theses/thesis.yaml           # dev-set metrics with confidence intervals; detail -> private/evals/
+dealsource stats                                              # LLM latency, tokens and cache hit rates
 ```
+
+The held-out test set is evaluated once, at the end: `dealsource eval --thesis ... --set test --final`.
 
 ## Getting a SAM.gov API key (free, optional)
 
